@@ -80,6 +80,8 @@ class Store:
             return self._get(kind, object_id, set())
 
     def _get(self, kind, object_id, visiting):
+        if not valid_id(object_id):
+            raise UserError("Некорректный идентификатор объекта.")
         if kind == "video" and object_id in self._cache:
             self._cache.move_to_end(object_id)
             return self._cache[object_id]
@@ -179,7 +181,14 @@ class Store:
                 raise UserError("Контрольная сумма исходного файла не совпадает.")
             target = self.asset_path(asset_id)
             target.parent.mkdir(exist_ok=True)
-            if not target.exists():
+            # The incoming stream has been verified in full. Reinstalling it
+            # also repairs an existing truncated/corrupt file with the same ID.
+            # Stop readers that may still hold the old file open before repair.
+            with self._lock:
+                for key, decoder in list(self._decoders.items()):
+                    if decoder.path == target:
+                        decoder.close()
+                        del self._decoders[key]
                 os.replace(temporary, target)
             return asset_id
         finally:
@@ -243,6 +252,10 @@ class Store:
         if previous and previous["type"] == "lut":
             table = self.get("lut", previous["table"]).translate(table)
             base_id = previous["base"]
+        if video_id == base_id:
+            # Two effects can reproduce the original bytes exactly. Reuse the
+            # original object instead of creating a self-referencing recipe.
+            return base_id
         table_id = self.put("lut", table)
         self.import_recipe(video_id, {"type": "lut", "base": base_id, "table": table_id})
         return video_id
