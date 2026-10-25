@@ -10,59 +10,147 @@ import json
 import mimetypes
 from pathlib import Path
 import re
+import shutil
 import threading
 import traceback
 from urllib.parse import parse_qs, unquote, urlsplit
 import uuid
 import wave
 
-from . import media
+from . import maintenance, media
+from .cloud import CloudProject, clone_from_cloud, list_shared_projects
 from .locking import DirectoryLock
 from .merge import CHANNELS, FRAME_BYTES, SAMPLE_RATE, read_audio
 from .repository import Repository
-from .storage import UserError, canonical, valid_id
+from .storage import Store, UserError, canonical, valid_id
+from .workspace import Workspace, folder_size
 
 MAX_UPLOAD = 4 * 1024 ** 3
 STATIC = Path(__file__).parent / "static"
+WORKSPACE_ACTIONS = {"project_create", "project_open", "project_close", "project_forget",
+                     "project_register", "project_migrate", "project_clone_cloud"}
+
+
+def store_stats(repo: Repository):
+    if hasattr(repo.store, "stats"):
+        try:
+            stats = dict(repo.store.stats())
+            stats["folder_bytes"] = folder_size(repo.root)
+            return stats
+        except Exception:
+            pass
+    return {"folder_bytes": folder_size(repo.root)}
 
 
 class App:
-    def __init__(self, root: Path):
-        self.directory_lock = DirectoryLock(Path(root))
-        try:
-            self.repo = Repository(root)
-            self.root = self.repo.root
-            for directory in ("uploads", "preview", "bundles"):
-                (self.root / directory).mkdir(exist_ok=True)
-        except Exception:
-            self.directory_lock.close()
-            raise
+    """One server process: either a single `--data-dir` project or a workspace of projects."""
+
+    def __init__(self, root: Path | None = None, workspace: Workspace | None = None, store_factory=Store):
+        if (root is None) == (workspace is None):
+            raise ValueError("Pass exactly one of root or workspace")
+        self.workspace = workspace
+        self.store_factory = store_factory
+        self.workspace_lock = DirectoryLock(workspace.root) if workspace else None
+        self.repo = self.root = self.directory_lock = self.entry = None
+        self.storage = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="media")
         self.jobs = {}
         self.job_lock = threading.Lock()
         self.active = None
         self.snapshot = {"project": None, "ffmpeg": media.tools_available(), "busy": False}
+        try:
+            if workspace:
+                (workspace.root / "uploads").mkdir(exist_ok=True)
+            else:
+                self.open_project(Path(root))
+        except Exception:
+            self.close()
+            raise
         self.status()
+
+    # ----- project lifecycle ------------------------------------------------------
+
+    def open_project(self, path: Path, entry: dict | None = None):
+        lock = DirectoryLock(Path(path))
+        try:
+            repo = Repository(path, store=self.store_factory(Path(path).resolve()))
+            for directory in ("uploads", "preview", "bundles"):
+                (repo.root / directory).mkdir(exist_ok=True)
+        except Exception:
+            lock.close()
+            raise
+        self.repo, self.root, self.directory_lock, self.entry = repo, repo.root, lock, entry
+        self.storage = store_stats(repo)
+        if self.workspace and entry:
+            self.workspace.touch(entry["id"], self.storage)
+
+    def close_project(self):
+        if self.repo is None:
+            return
+        if self.workspace and self.entry:
+            try:
+                self.workspace.update_storage(self.entry["id"], store_stats(self.repo))
+            except UserError:
+                pass
+        if hasattr(self.repo.store, "close"):
+            self.repo.store.close()
+        self.directory_lock.close()
+        self.repo = self.root = self.directory_lock = self.entry = None
+        self.storage = None
+        with self.job_lock:
+            self.snapshot = {"project": None, "ffmpeg": media.tools_available(), "busy": self.active is not None}
 
     def close(self):
         self.executor.shutdown(wait=True)
-        self.directory_lock.close()
+        self.close_project()
+        if self.workspace_lock:
+            self.workspace_lock.close()
 
     def busy(self):
         with self.job_lock:
             return self.active is not None
 
+    def require_repo(self):
+        if self.repo is None:
+            raise UserError("Сначала откройте проект.")
+        return self.repo
+
+    @property
+    def upload_dir(self):
+        return (self.root if self.repo else self.workspace.root) / "uploads"
+
+    def context(self):
+        mode = "workspace" if self.workspace else "single"
+        project = None
+        if self.entry:
+            project = {"id": self.entry["id"], "name": self.entry["name"]}
+        return {"mode": mode, "open": self.repo is not None, "workspace_project": project,
+                "data_dir": str(self.root) if self.root else None}
+
     def status(self):
+        if self.repo is None:
+            with self.job_lock:
+                return {"project": None, **self.context(), "ffmpeg": media.tools_available(),
+                        "busy": self.active is not None}
+        repo = self.repo
         # A reloaded page can still show the last consistent snapshot and busy
         # state while FFmpeg or merging holds the repository mutation lock.
-        if not self.repo.lock.acquire(blocking=False):
+        if not repo.lock.acquire(blocking=False):
             with self.job_lock:
                 result = deepcopy(self.snapshot)
                 result["busy"] = self.active is not None
                 return result
         try:
-            result = self.repo.status()
+            result = repo.status()
+            result.update(self.context())
             result["ffmpeg"] = media.tools_available()
+            result["storage"] = self.storage
+            try:
+                cloud = CloudProject.load(repo)
+                result["cloud"] = {"connected": bool(cloud), "device": cloud.device if cloud else None,
+                                   "folder": str(cloud.folder) if cloud else None}
+            except UserError as error:
+                result["cloud"] = {"connected": False, "error": str(error)}
             if result["project"]:
                 ref = result["manifest"]
                 result["preview_url"] = f"/media/preview/{ref}.mp4" if (self.root / "preview" / f"{ref}.mp4").exists() else None
@@ -71,12 +159,24 @@ class App:
                 self.snapshot = deepcopy(result)
             return result
         finally:
-            self.repo.lock.release()
+            repo.lock.release()
+
+    def projects(self):
+        if not self.workspace:
+            raise UserError("Список проектов доступен при запуске без --data-dir.")
+        return {"root": str(self.workspace.root), "projects": self.workspace.listing(),
+                "current": self.entry["id"] if self.entry else None}
+
+    def cloud_status(self):
+        repo = self.require_repo()
+        with repo.lock:
+            cloud = CloudProject.load(repo)
+            return cloud.status() if cloud else {"connected": False}
 
     def upload_path(self, token):
         if not isinstance(token, str) or not re.fullmatch(r"[a-f0-9]{32}", token):
             raise UserError("Некорректный идентификатор загрузки.")
-        path = self.root / "uploads" / token
+        path = self.upload_dir / token
         if not path.is_file():
             raise UserError("Загрузка не найдена. Выберите файл повторно.")
         return path
@@ -115,18 +215,89 @@ class App:
             media.render(self.repo.store, self.repo.manifest(ref), path, progress)
         return f"/media/preview/{manifest_id}.mp4"
 
+    def _workspace_action(self, job_id, action, data):
+        if not self.workspace:
+            raise UserError("Управление проектами доступно при запуске без --data-dir.")
+        progress = lambda p: self._update(job_id, progress=max(0, min(.99, p)))
+        if action == "project_create":
+            self.close_project()
+            entry = self.workspace.create(data.get("name"))
+            self.open_project(Path(entry["path"]), entry)
+            return {"message": f"Проект «{entry['name']}» создан.", "project": entry["id"]}
+        if action == "project_open":
+            entry = self.workspace.entry(data.get("id"))
+            if self.entry and self.entry["id"] == entry["id"]:
+                return {"message": "Проект уже открыт.", "project": entry["id"]}
+            if not Path(entry["path"]).is_dir():
+                raise UserError("Папка проекта не найдена. Возможно, её переместили или удалили.")
+            self.close_project()
+            self.open_project(Path(entry["path"]), entry)
+            return {"message": f"Открыт проект «{entry['name']}».", "project": entry["id"]}
+        if action == "project_close":
+            self.close_project()
+            return {"message": "Проект закрыт."}
+        if action == "project_forget":
+            entry = self.workspace.entry(data.get("id"))
+            if self.entry and self.entry["id"] == entry["id"]:
+                raise UserError("Сначала закройте проект.")
+            self.workspace.forget(entry["id"])
+            return {"message": "Проект убран из списка. Его папка не удалена."}
+        if action == "project_register":
+            path = Path(str(data.get("path", "")).strip()).expanduser()
+            if not path.is_absolute():
+                raise UserError("Укажите полный путь к папке проекта.")
+            entry = self.workspace.register(path)
+            return {"message": f"Проект «{entry['name']}» добавлен в список.", "project": entry["id"]}
+        if action == "project_migrate":
+            entry = self.workspace.entry(data.get("id"))
+            if self.entry and self.entry["id"] == entry["id"]:
+                raise UserError("Закройте проект перед конвертацией.")
+            original = data.get("source_media")
+            original = Path(str(original).strip()).expanduser() if original else None
+            if original is not None and not original.is_absolute():
+                raise UserError("Укажите полный путь к исходному видеофайлу.")
+            target = self.workspace.projects_dir / f"{entry['id']}-compact-{uuid.uuid4().hex[:6]}"
+            report = maintenance.migrate(Path(entry["path"]), target, original,
+                                         lambda text, value: self._update(job_id, progress=min(.99, value), message=text),
+                                         store_factory=self.store_factory)
+            copy = self.workspace.register(target, f"{entry['name']} (компактная копия)")
+            self.workspace.update_storage(copy["id"], {"folder_bytes": report["after_bytes"]})
+            return {"message": (f"Создана компактная копия: {maintenance.format_size(report['before_bytes'])} → "
+                                f"{maintenance.format_size(report['after_bytes'])}. Исходный проект не изменён."),
+                    "project": copy["id"], "report": report}
+        if action == "project_clone_cloud":
+            self.close_project()
+            entry = self.workspace.create(data.get("name") or "Общий проект")
+            try:
+                self.open_project(Path(entry["path"]), entry)
+                result = clone_from_cloud(self.repo, data.get("folder"), data.get("project"),
+                                          data.get("source_device"), data.get("device"), progress)
+            except Exception:
+                self.close_project()
+                self.workspace.forget(entry["id"])
+                shutil.rmtree(entry["path"], ignore_errors=True)  # the folder was created by this action
+                raise
+            return {"message": "Общий проект получен. Дальше публикуйте и получайте версии на вкладке «Облако».",
+                    "project": entry["id"], "branches": result["branches"]}
+        raise UserError("Неизвестное действие.")
+
     def _run(self, job_id, data):
         source = None
         try:
-            with self.repo.lock:
-                action = data["action"]
+            action = data["action"]
+            if action in WORKSPACE_ACTIONS:
+                result = self._workspace_action(job_id, action, data)
+                self._update(job_id, status="done", progress=1, result=result)
+                return
+            repo = self.require_repo()
+            with repo.lock:
                 if action in {"import", "bundle_import"} or (action == "edit" and data.get("upload")):
                     source = self.upload_path(data.get("upload"))
                 progress = lambda p: self._update(job_id, progress=min(.65, max(0, p) * .65))
                 result = {"message": "Готово"}
                 if action == "import":
                     if self.repo.state["project"]:
-                        raise UserError("Проект уже открыт. Для нового запустите приложение с другим --data-dir.")
+                        raise UserError("В этом проекте уже есть видео. Создайте новый проект в списке проектов.")
                     manifest = media.import_media(self.repo.store, source, progress)
                     result["commit"] = self.repo.initialise(manifest, data.get("name", "Видео"))
                     result["message"] = "Видео импортировано; первая версия сохранена."
@@ -167,19 +338,42 @@ class App:
                         result["download_url"] = url + "?download=1"
                         result["message"] = "Видео готово к скачиванию."
                 elif action == "bundle_export":
+                    for old in (self.root / "bundles").glob("*.vmrepo"):
+                        old.unlink(missing_ok=True)  # earlier exports were already offered for download
                     filename = uuid.uuid4().hex + ".vmrepo"
-                    self.repo.export_bundle(self.root / "bundles" / filename)
+                    self.repo.export_bundle(self.root / "bundles" / filename, lambda p: self._update(job_id, progress=p * .99))
                     result["download_url"] = f"/media/bundles/{filename}"
                     result["message"] = "Репозиторий готов к передаче на другой компьютер."
                 elif action == "bundle_import":
                     opening_project = self.repo.state["project"] is None
-                    self.repo.import_bundle(source, data.get("peer", "peer"))
+                    self.repo.import_bundle(source, data.get("peer", "peer"), progress)
                     result["message"] = (
                         "Репозиторий открыт. История и ветки восстановлены." if opening_project else
                         "Репозиторий получен. Входящие ветки доступны для слияния.")
+                elif action == "cloud_connect":
+                    cloud = CloudProject.connect(self.repo, data.get("folder"), data.get("device"))
+                    result["message"] = f"Общая папка подключена. Это устройство: {cloud.device}."
+                elif action == "cloud_disconnect":
+                    CloudProject.disconnect(self.repo)
+                    result["message"] = "Общая папка отключена. Файлы в ней не удалены."
+                elif action == "cloud_publish":
+                    cloud = self._cloud()
+                    published = cloud.publish(lambda p: self._update(job_id, progress=p * .99))
+                    result.update(published)
+                    result["message"] = (f"Опубликованы ветки: {', '.join(published['branches'])}. Скопировано файлов: "
+                                         f"{published['copied']} ({maintenance.format_size(published['copied_bytes'])}), "
+                                         f"уже были в папке: {published['skipped']}.")
+                    if self.repo.dirty():
+                        result["message"] += " Несохранённый черновик не публикуется."
+                elif action == "cloud_receive":
+                    received = self._cloud().receive(data.get("device"), progress)
+                    result.update(received)
+                    result["message"] = (f"Получены ветки: {', '.join(received['branches'])}. "
+                                         "Влейте нужную на вкладке «Слияние».")
                 else:
                     raise UserError("Неизвестное действие.")
-                if self.repo.state["project"] and action not in {"export", "preview", "bundle_export"}:
+                if self.repo.state["project"] and action not in {"export", "preview", "bundle_export", "cloud_connect",
+                                                                  "cloud_disconnect", "cloud_publish"}:
                     self._update(job_id, progress=.67, message="Подготовка предпросмотра…")
                     try:
                         result["preview_url"] = self.ensure_preview(
@@ -187,6 +381,7 @@ class App:
                     except (UserError, OSError) as error:
                         # Editing and committing remain valid even if an optional MP4 preview fails.
                         result["message"] += " Предпросмотр недоступен: " + str(error)
+                self.storage = store_stats(self.repo)
                 self._update(job_id, status="done", progress=1, result=result)
         except UserError as error:
             self._update(job_id, status="error", error=str(error))
@@ -198,6 +393,12 @@ class App:
                 source.unlink(missing_ok=True)
             with self.job_lock:
                 self.active = None
+
+    def _cloud(self):
+        cloud = CloudProject.load(self.repo)
+        if not cloud:
+            raise UserError("Сначала подключите общую папку облачного клиента.")
+        return cloud
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -249,18 +450,27 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_response(self.app.status())
             elif path.startswith("/api/jobs/"):
                 self.json_response(self.app.job(path.rsplit("/", 1)[-1]))
+            elif path == "/api/projects":
+                self.json_response(self.app.projects())
+            elif path == "/api/cloud":
+                self.json_response(self.app.cloud_status())
+            elif path == "/api/cloud/projects":
+                self.json_response({"projects": list_shared_projects(query.get("folder", ""))})
             elif path == "/api/diff":
-                with self.app.repo.lock:
-                    self.json_response(self.app.repo.diff(query.get("left", self.app.repo.head), query.get("right", "working")))
+                repo = self.app.require_repo()
+                with repo.lock:
+                    self.json_response(repo.diff(query.get("left", repo.head), query.get("right", "working")))
             elif path == "/api/frame":
-                with self.app.repo.lock:
-                    manifest = self.app.repo.manifest(query.get("ref", "working"))
-                    other = self.app.repo.manifest(query["diff_with"]) if query.get("diff_with") else None
-                    data = media.png_frame(self.app.repo.store, manifest, int(query.get("frame", 0)), other)
+                repo = self.app.require_repo()
+                with repo.lock:
+                    manifest = repo.manifest(query.get("ref", "working"))
+                    other = repo.manifest(query["diff_with"]) if query.get("diff_with") else None
+                    data = media.png_frame(repo.store, manifest, int(query.get("frame", 0)), other)
                     self.send_bytes(data, "image/png")
             elif path == "/api/audio":
-                with self.app.repo.lock:
-                    manifest = self.app.repo.manifest(query.get("ref", "working"))
+                repo = self.app.require_repo()
+                with repo.lock:
+                    manifest = repo.manifest(query.get("ref", "working"))
                     start, end = media.interval(manifest, query.get("start", 0),
                                                 query.get("end", min(60, manifest["samples"] / SAMPLE_RATE)))
                     if end - start > 60 * SAMPLE_RATE:
@@ -270,13 +480,14 @@ class Handler(BaseHTTPRequestHandler):
                         audio.setnchannels(CHANNELS)
                         audio.setsampwidth(2)
                         audio.setframerate(SAMPLE_RATE)
-                        audio.writeframes(read_audio(self.app.repo.store, manifest, start * FRAME_BYTES, end * FRAME_BYTES))
+                        audio.writeframes(read_audio(repo.store, manifest, start * FRAME_BYTES, end * FRAME_BYTES))
                     self.send_bytes(buffer.getvalue(), "audio/wav")
             elif path.startswith("/media/"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 3:
                     raise UserError("Файл не найден.")
                 _, kind, name = parts
+                self.app.require_repo()
                 if kind == "preview" and name.endswith(".mp4") and valid_id(name[:-4]):
                     self.send_file(self.app.root / kind / name, "video/mp4", bool(query.get("download")))
                 elif kind == "bundles" and re.fullmatch(r"[a-f0-9]{32}\.vmrepo", name):
@@ -319,7 +530,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not 0 < length <= MAX_UPLOAD:
                     raise UserError("Размер загрузки должен быть от 1 байта до 4 ГиБ.")
                 token = uuid.uuid4().hex
-                target = self.app.root / "uploads" / token
+                target = self.app.upload_dir / token
                 self.connection.settimeout(120)
                 try:
                     with target.open("xb") as output:
@@ -413,10 +624,11 @@ class LocalServer(ThreadingHTTPServer):
         super().server_close()
 
 
-def make_server(root: Path, port=8765):
+def make_server(root: Path | None = None, port=8765, workspace: Path | None = None, store_factory=Store):
+    """`root` opens one project folder (legacy --data-dir); `workspace` shows the project list."""
     server = LocalServer(("127.0.0.1", port), Handler)
     try:
-        server.app = App(root)
+        server.app = App(root, Workspace(workspace) if workspace else None, store_factory)
     except Exception:
         server.server_close()
         raise
