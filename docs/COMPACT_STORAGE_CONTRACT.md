@@ -113,6 +113,8 @@ once, using ZIP_STORED in portable archives. LUT base dependencies are included.
 `stats` returns at least `object_bytes`, `asset_bytes`, `index_bytes`,
 `total_bytes`, `frame_cache_bytes`, and counts `objects`, `assets`, `recipes`.
 `close` closes decoder processes and SQLite; call it when closing a project.
+Call `store.flush()` before atomically publishing imported branch refs/state;
+staged recipes must be durable before a state file can reference their IDs.
 
 ## Media API (primary implementation)
 
