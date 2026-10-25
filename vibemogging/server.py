@@ -172,8 +172,11 @@ class App:
                     result["download_url"] = f"/media/bundles/{filename}"
                     result["message"] = "Репозиторий готов к передаче на другой компьютер."
                 elif action == "bundle_import":
+                    opening_project = self.repo.state["project"] is None
                     self.repo.import_bundle(source, data.get("peer", "peer"))
-                    result["message"] = "Репозиторий получен. Входящие ветки доступны для слияния."
+                    result["message"] = (
+                        "Репозиторий открыт. История и ветки восстановлены." if opening_project else
+                        "Репозиторий получен. Входящие ветки доступны для слияния.")
                 else:
                     raise UserError("Неизвестное действие.")
                 if self.repo.state["project"] and action not in {"export", "preview", "bundle_export"}:
