@@ -7,7 +7,7 @@
 
 ## Статус V1
 
-Интерфейс объединён с ядром в ветке `feature/v1-core`: доступен работающий
+Интерфейс объединён с ядром в ветке `main`: доступен работающий
 прототип редактора. Backend проходит 27 автоматических проверок; объединённая
 версия проверена в Chromium с сервером в Ubuntu/WSL.
 
@@ -34,7 +34,7 @@
 sudo apt install python3 ffmpeg
 git clone git@github.com:dmitriifolts54/vibemogging_228.git
 cd vibemogging_228
-git switch feature/v1-core
+git switch main
 python3 -m vibemogging
 ```
 
