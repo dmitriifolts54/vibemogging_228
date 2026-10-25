@@ -29,6 +29,7 @@ from . import media
 from .locking import DirectoryLock
 from .repository import Repository
 from .storage import Store, UserError, atomic_write, canonical, digest
+from .video_sources import video_command
 from .workspace import folder_size
 
 COMPACT_API = ("add_asset", "register_source_frame", "recipe", "flush", "close")
@@ -85,10 +86,10 @@ def encode_clip(frames, width, height, fps: Fraction, output: Path, read_frame, 
             raise UserError("FFmpeg не смог упаковать кадры: " + errors.read(800).decode(errors="replace"))
 
 
-def decoded_ids(path: Path, width, height, count):
-    """Content IDs of the frames FFmpeg decodes from a clip (streamed, one frame in memory)."""
-    args = media.command("-i", path, "-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1")
-    size = width * height * 3
+def decoded_ids(path: Path, profile: dict, count):
+    """Content IDs of the frames the Store's own decoder pipeline yields (streamed)."""
+    args = video_command(path, profile)
+    size = profile["width"] * profile["height"] * 3
     ids = []
     with tempfile.TemporaryFile() as errors:
         process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=errors)
@@ -165,14 +166,32 @@ def _copy(old, store, partial, original, progress, clip_frames, preset):
         store.put("audio", old.store.get("audio", audio_id))  # exact PCM, unchanged
     frames = list(dict.fromkeys(ref for mid in manifest_ids for ref in manifests[mid]["video"]))
     report = {"frames": len(frames), "from_original": 0, "packed": 0, "fallback": 0, "clips": 0,
-              "commits": len(commits), "manifests": len(manifests), "audio_blocks": len(set(audio)),
-              "original_matched": None}
+              "kept_recipes": 0, "commits": len(commits), "manifests": len(manifests),
+              "audio_blocks": len(set(audio)), "original_matched": None}
+    # Frames that already have source/LUT recipes (repositories touched by the
+    # compact engine) are carried over as recipes; only raw RGB objects are packed.
+    raw = frames
+    if hasattr(old.store, "export_plan"):
+        plan = old.store.export_plan([("video", ref) for ref in frames])
+        for asset in plan["assets"]:
+            if not store.asset_path(asset).is_file():
+                with old.store.asset_path(asset).open("rb") as stream:
+                    store.import_asset(stream, asset, old.store.asset_path(asset).stat().st_size)
+        for item in plan["objects"]:
+            if item["kind"] == "lut":
+                store.put("lut", old.store.get("lut", item["id"]))
+        for video_id, recipe in plan["recipes"].items():
+            store.import_recipe(video_id, recipe)
+        report["kept_recipes"] = len(plan["recipes"])
+        raw = [item["id"] for item in plan["objects"] if item["kind"] == "video"]
+        order = {ref: number for number, ref in enumerate(frames)}
+        raw.sort(key=lambda ref: order.get(ref, len(order)))  # LUT bases follow timeline order
     covered = set()
     if original:
         covered = _use_original(old, store, partial, Path(original), first, fps, progress)
         report["original_matched"] = bool(covered)
-        report["from_original"] = len(covered)
-    remaining = [ref for ref in frames if ref not in covered]
+        report["from_original"] = len(covered & set(raw))
+    remaining = [ref for ref in raw if ref not in covered]
     workdir = partial / ".pack"
     workdir.mkdir()
     profile = {"width": width, "height": height, "fps": [fps.numerator, fps.denominator],
@@ -181,7 +200,7 @@ def _copy(old, store, partial, original, progress, clip_frames, preset):
         chunk = remaining[start:start + clip_frames]
         clip = workdir / f"clip-{start // clip_frames:06d}.mkv"
         encode_clip(chunk, width, height, fps, clip, lambda ref: old.store.get("video", ref), preset)
-        decoded = decoded_ids(clip, width, height, len(chunk))
+        decoded = decoded_ids(clip, profile, len(chunk))
         exact = len(decoded) == len(chunk) and decoded == chunk
         if exact:
             asset = store.add_asset(clip)

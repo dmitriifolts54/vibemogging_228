@@ -137,6 +137,9 @@ class Repository:
             raise ValueError("Invalid pending merge")
 
     def save(self):
+        # Recipes referenced by the new state must be durable before state.json points at them.
+        if hasattr(self.store, "flush"):
+            self.store.flush()
         atomic_write(self.root / "state.json", canonical(self.state))
 
     @property

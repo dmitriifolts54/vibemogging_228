@@ -37,7 +37,8 @@ class MigrationTests(unittest.TestCase):
                                      "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", source),
                        check=True, capture_output=True)
         self.legacy = Repository(self.root / "legacy")
-        manifest = media.import_media(self.legacy.store, source)
+        # compact=False reproduces the V1 layout: one zlib RGB object per frame.
+        manifest = media.import_media(self.legacy.store, source, compact=False)
         self.legacy.initialise(manifest, "source.mp4")
         # History with a branch, an uncommitted draft and a pending video conflict.
         self.legacy.branch("b")
@@ -66,8 +67,13 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(tree_digest(self.legacy.root), self.files_before, "source must stay untouched")
         self.assertEqual(json.loads((target / "state.json").read_text()), self.state_before)
         self.assertEqual(report["fallback"], 0)
-        self.assertEqual(report["packed"], report["frames"])
+        self.assertGreater(report["kept_recipes"], 0, "brighten/darken LUT recipes are carried over")
+        self.assertEqual(report["packed"] + report["kept_recipes"], report["frames"])
         self.assertEqual(report["verified_frames"], report["frames"])
+        self.assertEqual(len(list((target / "objects").rglob("*"))) and
+                         sum(1 for p in (target / "objects").rglob("*") if p.is_file()),
+                         report["commits"] + report["manifests"] + report["audio_blocks"] + 2,
+                         "no RGB frame objects remain: only metadata, audio and two LUT tables")
         self.assertGreater(report["before_bytes"], 0)
         compact = self.open_compact(target)
         for manifest_id in maintenance.manifests_to_keep(self.legacy)[1]:
@@ -99,7 +105,7 @@ class MigrationTests(unittest.TestCase):
         with patch.object(maintenance, "decoded_ids", return_value=[]):
             report = self.migrate(target)
         self.assertEqual(report["packed"], 0)
-        self.assertEqual(report["fallback"], report["frames"])
+        self.assertEqual(report["fallback"] + report["kept_recipes"], report["frames"])
         compact = self.open_compact(target)
         self.assertEqual(compact.manifest(), self.legacy.manifest())
 

@@ -209,6 +209,7 @@ class CloudProject:
     def publish(self, progress=lambda value: None) -> dict:
         self.check_project()
         repo, store = self.repo, self.repo.store
+        store.flush()
         snapshot = repo.export_snapshot()
         files, copied, skipped, copied_bytes = {}, 0, 0, 0
         total = max(1, len(snapshot["objects"]) + len(snapshot["assets"]) + 1)
