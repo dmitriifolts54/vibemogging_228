@@ -104,6 +104,29 @@ class MediaIntegrationTests(unittest.TestCase):
         self.assertEqual(manifest["samples"], 2 * SAMPLE_RATE)
         self.assertTrue(any(read_audio(store, manifest, 0, 1000)), "Early soundtrack was lost")
 
+    def test_status_remains_available_during_media_operation(self):
+        server = make_server(self.root / "nonblocking-status", port=0)
+        result, completed = [], threading.Event()
+
+        def read_status():
+            result.append(server.app.status())
+            completed.set()
+
+        thread = threading.Thread(target=read_status, daemon=True)
+        try:
+            with server.app.repo.lock:
+                with server.app.job_lock:
+                    server.app.active = "busy-test"
+                thread.start()
+                returned_while_locked = completed.wait(timeout=1)
+            thread.join(timeout=5)
+            self.assertTrue(returned_while_locked, "Status waited for the long-running media lock")
+            self.assertTrue(result[0]["busy"])
+            self.assertIsNone(result[0]["project"])
+        finally:
+            server.app.active = None
+            server.server_close()
+
     def test_real_http_upload_job_edit_export_and_ranges(self):
         server = make_server(self.root / "http-repo", port=0)
         thread = threading.Thread(target=server.serve_forever, daemon=True)

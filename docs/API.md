@@ -53,6 +53,8 @@ Loaded repository (illustrative):
 `preview_url` may be null when there is no cached preview. Request `preview`
 to render it. `drafts` identifies branches with saved working drafts; these
 drafts survive switching branches and restarting the application.
+During a media mutation, status immediately returns the last consistent snapshot
+with `busy: true`; refresh after the job finishes to see the new state.
 
 An additional `incoming` string array lists imported tracking branches (such as
 `bob/main`). Bundles export local branches and their reachable committed history;

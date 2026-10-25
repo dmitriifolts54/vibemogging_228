@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
@@ -40,6 +41,8 @@ class App:
         self.jobs = {}
         self.job_lock = threading.Lock()
         self.active = None
+        self.snapshot = {"project": None, "ffmpeg": media.tools_available(), "busy": False}
+        self.status()
 
     def close(self):
         self.executor.shutdown(wait=True)
@@ -50,13 +53,25 @@ class App:
             return self.active is not None
 
     def status(self):
-        with self.repo.lock:
+        # A reloaded page can still show the last consistent snapshot and busy
+        # state while FFmpeg or merging holds the repository mutation lock.
+        if not self.repo.lock.acquire(blocking=False):
+            with self.job_lock:
+                result = deepcopy(self.snapshot)
+                result["busy"] = self.active is not None
+                return result
+        try:
             result = self.repo.status()
-            result.update(ffmpeg=media.tools_available(), busy=self.busy())
+            result["ffmpeg"] = media.tools_available()
             if result["project"]:
                 ref = result["manifest"]
                 result["preview_url"] = f"/media/preview/{ref}.mp4" if (self.root / "preview" / f"{ref}.mp4").exists() else None
+            with self.job_lock:
+                result["busy"] = self.active is not None
+                self.snapshot = deepcopy(result)
             return result
+        finally:
+            self.repo.lock.release()
 
     def upload_path(self, token):
         if not isinstance(token, str) or not re.fullmatch(r"[a-f0-9]{32}", token):
