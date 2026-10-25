@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vibemogging</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">▶</span>
+      <span class="brand-name">Vibemogging</span>
+      <span class="project-name" id="projectName"></span>
+    </div>
+    <div class="topbar-state" id="topbarState" hidden>
+      <label class="branch-picker">
+        <span class="label">Ветка</span>
+        <select id="branchSelect" data-mutate aria-label="Текущая ветка"></select>
+      </label>
+      <span class="chip" id="dirtyChip" hidden>Черновик</span>
+      <span class="chip chip-warn" id="mergeChip" hidden>Слияние</span>
+      <span class="meta" id="projectMeta"></span>
+    </div>
+    <div class="topbar-actions" id="topbarActions" hidden>
+      <button type="button" id="exportMp4Btn" data-mutate>Экспорт MP4</button>
+      <button type="button" id="exportRepoBtn" data-mutate>Экспорт .vmrepo</button>
+      <button type="button" id="importRepoBtn" data-mutate>Импорт .vmrepo</button>
+    </div>
+  </header>
+
+  <div class="jobbar" id="jobbar" hidden>
+    <div class="jobbar-text"><span class="spinner" aria-hidden="true"></span><span id="jobText">Обработка…</span></div>
+    <progress id="jobProgress" max="1" value="0"></progress>
+    <span class="jobbar-percent" id="jobPercent">0%</span>
+  </div>
+
+  <div class="banner banner-error" id="ffmpegBanner" hidden>
+    FFmpeg или ffprobe не найдены. Импорт, правки с файлами, предпросмотр и экспорт недоступны —
+    установите FFmpeg и перезапустите приложение.
+  </div>
+  <div class="banner banner-error" id="offlineBanner" hidden>
+    Нет связи с локальным сервером. Убедитесь, что запущено <code>python3 -m vibemogging</code>.
+  </div>
+
+  <!-- Empty repository -->
+  <main class="empty" id="emptyView" hidden>
+    <h1>Новый проект</h1>
+    <p class="muted">Все данные хранятся локально в папке данных приложения.</p>
+    <div class="empty-cards">
+      <section class="card">
+        <h2>Импорт видео</h2>
+        <p class="muted">Ролик будет приведён к постоянному FPS. Первая версия сохранится автоматически.</p>
+        <label class="file-field">
+          <input type="file" id="importVideoFile" accept="video/*,.mp4,.mov,.mkv,.webm,.avi" data-mutate>
+        </label>
+        <button type="button" class="primary" id="importVideoBtn" data-mutate disabled>Импортировать видео</button>
+      </section>
+      <section class="card">
+        <h2>Открыть репозиторий</h2>
+        <p class="muted">Файл <code>.vmrepo</code>, полученный с другого компьютера, со всей историей и ветками.</p>
+        <label class="file-field">
+          <input type="file" id="openRepoFile" accept=".vmrepo" data-mutate>
+        </label>
+        <button type="button" class="primary" id="openRepoBtn" data-mutate disabled>Открыть репозиторий</button>
+      </section>
+    </div>
+  </main>
+
+  <!-- Loaded project -->
+  <main class="workspace" id="workspace" hidden>
+    <section class="stage">
+      <div class="player-panel panel">
+        <div class="player-head">
+          <div class="seg" role="tablist" aria-label="Режим просмотра">
+            <button type="button" role="tab" class="seg-btn active" data-view="video">Видео</button>
+            <button type="button" role="tab" class="seg-btn" data-view="frame">Точный кадр</button>
+          </div>
+          <span class="player-source" id="playerSource">Рабочая версия</span>
+          <button type="button" class="link" id="backToWorkingBtn" hidden>Вернуться к рабочей версии</button>
+        </div>
+        <div class="player-box">
+          <video id="video" controls preload="metadata" playsinline></video>
+          <img id="frameImage" alt="Кадр рабочей версии" hidden>
+          <div class="player-placeholder" id="previewMissing" hidden>
+            <p>Предпросмотр ещё не подготовлен.</p>
+            <button type="button" id="renderPreviewBtn" data-mutate>Подготовить предпросмотр</button>
+          </div>
+        </div>
+        <div class="transport">
+          <button type="button" class="icon" id="prevFrameBtn" title="Предыдущий кадр" aria-label="Предыдущий кадр">◀︎|</button>
+          <button type="button" class="icon" id="playBtn" title="Воспроизвести / пауза" aria-label="Воспроизвести">▶︎</button>
+          <button type="button" class="icon" id="nextFrameBtn" title="Следующий кадр" aria-label="Следующий кадр">|▶︎</button>
+          <span class="timecode" id="timecode">00:00.00</span>
+          <label class="inline-field">
+            <span>Кадр</span>
+            <input type="number" id="frameInput" min="0" step="1" value="0" inputmode="numeric">
+          </label>
+          <button type="button" id="gotoFrameBtn">Перейти</button>
+          <span class="muted small" id="frameTotal"></span>
+        </div>
+      </div>
+
+      <div class="timeline-panel panel">
+        <div class="timeline-head">
+          <h2>Таймлайн</h2>
+          <div class="legend">
+            <span><i class="sw sw-sel"></i>Выбрано</span>
+            <span><i class="sw sw-diff"></i>Изменено в черновике</span>
+            <span><i class="sw sw-conf"></i>Конфликт</span>
+          </div>
+        </div>
+        <div class="timeline" id="timeline">
+          <div class="ruler" id="ruler"></div>
+          <div class="track" data-track="video">
+            <span class="track-label">Изображение</span>
+            <div class="track-lane" id="videoLane"></div>
+          </div>
+          <div class="track" data-track="audio">
+            <span class="track-label">Звук</span>
+            <div class="track-lane" id="audioLane"><canvas id="waveform"></canvas></div>
+          </div>
+          <div class="selection" id="selection" hidden></div>
+          <div class="playhead" id="playhead"></div>
+        </div>
+        <p class="hint">Щелчок — переход, перетаскивание — выбор диапазона. Границы — полуоткрытые: [начало, конец).</p>
+      </div>
+
+      <div class="edit-panel panel">
+        <h2>Правка диапазона</h2>
+        <div class="range-row">
+          <label class="inline-field">
+            <span>Начало</span>
+            <input type="text" id="rangeStart" value="00:00.00" spellcheck="false" autocomplete="off">
+          </label>
+          <button type="button" class="small-btn" id="startFromPlayhead" title="Начало = текущая позиция">⇤ из позиции</button>
+          <label class="inline-field">
+            <span>Конец</span>
+            <input type="text" id="rangeEnd" value="00:00.00" spellcheck="false" autocomplete="off">
+          </label>
+          <button type="button" class="small-btn" id="endFromPlayhead" title="Конец = текущая позиция">⇥ из позиции</button>
+          <span class="muted small" id="rangeInfo"></span>
+        </div>
+        <div class="ops" role="radiogroup" aria-label="Операция">
+          <fieldset>
+            <legend>Изображение</legend>
+            <label><input type="radio" name="op" value="replace_video" checked> Заменить видео</label>
+            <label><input type="radio" name="op" value="brighten"> Осветлить</label>
+            <label><input type="radio" name="op" value="darken"> Затемнить</label>
+            <label><input type="radio" name="op" value="fill"> Залить цветом</label>
+          </fieldset>
+          <fieldset>
+            <legend>Звук</legend>
+            <label><input type="radio" name="op" value="replace_audio"> Заменить звук</label>
+            <label><input type="radio" name="op" value="mute"> Отключить звук</label>
+            <label><input type="radio" name="op" value="gain"> Громкость</label>
+          </fieldset>
+        </div>
+        <div class="op-params">
+          <div class="param" data-for="replace_video replace_audio">
+            <label class="file-field">
+              <span id="replaceLabel">Файл-источник (видео)</span>
+              <input type="file" id="replaceFile" accept="video/*,audio/*">
+            </label>
+          </div>
+          <div class="param" data-for="replace_video replace_audio">
+            <label class="inline-field">
+              <span>Смещение в источнике, с</span>
+              <input type="number" id="replaceOffset" min="0" step="0.01" value="0">
+            </label>
+          </div>
+          <div class="param" data-for="fill">
+            <label class="inline-field">
+              <span>Цвет</span>
+              <input type="color" id="fillColor" value="#22aa88">
+            </label>
+          </div>
+          <div class="param" data-for="gain">
+            <label class="inline-field gain-field">
+              <span>Усиление</span>
+              <input type="range" id="gainValue" min="0" max="4" step="0.05" value="1">
+              <output id="gainOut">×1.00</output>
+            </label>
+          </div>
+        </div>
+        <div class="edit-actions">
+          <button type="button" class="primary" id="applyEditBtn" data-mutate>Применить к диапазону</button>
+          <span class="muted small">Длительность, FPS и разрешение не меняются. Вставка и удаление со сдвигом времени — в V2.</span>
+        </div>
+      </div>
+    </section>
+
+    <aside class="sidebar panel">
+      <nav class="tabs" role="tablist">
+        <button type="button" role="tab" class="tab active" data-tab="versions">Версии</button>
+        <button type="button" role="tab" class="tab" data-tab="branches">Ветки</button>
+        <button type="button" role="tab" class="tab" data-tab="compare">Сравнение</button>
+        <button type="button" role="tab" class="tab" data-tab="merge">Слияние <span class="badge" id="mergeBadge" hidden></span></button>
+      </nav>
+
+      <!-- Versions -->
+      <section class="tab-body" data-body="versions">
+        <div class="draft-box" id="draftBox">
+          <div class="draft-head">
+            <strong id="draftTitle">Нет несохранённых изменений</strong>
+            <button type="button" class="danger-ghost" id="discardBtn" data-mutate hidden>Сбросить черновик</button>
+          </div>
+          <ul class="intervals" id="draftIntervals"></ul>
+        </div>
+        <form class="commit-form" id="commitForm">
+          <label class="stack-field">
+            <span>Комментарий к версии</span>
+            <textarea id="commitMessage" rows="2" maxlength="2000" placeholder="Что изменилось?" data-mutate></textarea>
+          </label>
+          <div class="commit-row">
+            <label class="inline-field grow">
+              <span>Автор</span>
+              <input type="text" id="commitAuthor" maxlength="80" placeholder="Local editor" data-mutate>
+            </label>
+            <button type="submit" class="primary" id="commitBtn" data-mutate>Сохранить версию</button>
+          </div>
+        </form>
+        <h3>История</h3>
+        <ol class="history" id="historyList"></ol>
+      </section>
+
+      <!-- Branches -->
+      <section class="tab-body" data-body="branches" hidden>
+        <form class="branch-form" id="branchForm">
+          <label class="inline-field grow">
+            <span>Новая ветка</span>
+            <input type="text" id="branchName" placeholder="color-fix" pattern="[A-Za-z0-9][A-Za-z0-9._\/\-]{0,79}" maxlength="80" spellcheck="false" data-mutate>
+          </label>
+          <button type="submit" id="branchCreateBtn" data-mutate>Создать</button>
+        </form>
+        <p class="hint">Латинские буквы, цифры, «.», «_», «-», «/». Черновик текущей ветки копируется в новую.</p>
+        <h3>Локальные ветки</h3>
+        <ul class="branch-list" id="branchList"></ul>
+        <h3 id="incomingTitle">Входящие ветки</h3>
+        <ul class="branch-list" id="incomingList"></ul>
+      </section>
+
+      <!-- Compare -->
+      <section class="tab-body" data-body="compare" hidden>
+        <div class="compare-refs">
+          <label class="stack-field"><span>Слева (было)</span><select id="cmpLeft"></select></label>
+          <label class="stack-field"><span>Справа (стало)</span><select id="cmpRight"></select></label>
+          <button type="button" id="cmpRunBtn">Сравнить</button>
+        </div>
+        <div id="cmpResult" class="cmp-result">
+          <p class="muted">Выберите две версии. «Рабочая» — текущий черновик.</p>
+        </div>
+        <div class="cmp-frames" id="cmpFrames" hidden>
+          <div class="cmp-frame-head">
+            <label class="inline-field"><span>Кадр</span><input type="number" id="cmpFrame" min="0" step="1" value="0"></label>
+            <button type="button" id="cmpFromPlayhead">Из позиции</button>
+          </div>
+          <div class="cmp-grid">
+            <figure><img id="cmpImgLeft" alt="Кадр слева"><figcaption>Было</figcaption></figure>
+            <figure><img id="cmpImgRight" alt="Кадр справа"><figcaption>Стало</figcaption></figure>
+            <figure><img id="cmpImgDiff" alt="Разница кадров"><figcaption>Разница |RGB|</figcaption></figure>
+          </div>
+          <div class="cmp-audio">
+            <div class="cmp-audio-head">
+              <span>Звук в выбранном диапазоне таймлайна</span>
+              <button type="button" id="cmpAudioLoad">Загрузить фрагменты</button>
+            </div>
+            <div class="audio-pair" id="cmpAudioPair" hidden>
+              <label>Было <audio id="cmpAudioLeft" controls preload="none"></audio></label>
+              <label>Стало <audio id="cmpAudioRight" controls preload="none"></audio></label>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Merge -->
+      <section class="tab-body" data-body="merge" hidden>
+        <div id="mergeIdle">
+          <p class="muted">Объединить другую ветку с текущей. Независимые правки изображения и звука применяются автоматически; совпадающие позиции с разными правками станут конфликтами.</p>
+          <label class="stack-field">
+            <span>Влить ветку в <strong id="mergeTarget"></strong></span>
+            <select id="mergeSource" data-mutate></select>
+          </label>
+          <button type="button" class="primary" id="mergeBtn" data-mutate>Начать слияние</button>
+          <p class="hint" id="mergeHint"></p>
+        </div>
+        <div id="mergeActive" hidden>
+          <div class="merge-summary" id="mergeSummary"></div>
+          <ul class="conflicts" id="conflictList"></ul>
+          <form class="commit-form" id="mergeCommitForm">
+            <label class="stack-field">
+              <span>Комментарий к коммиту слияния</span>
+              <textarea id="mergeMessage" rows="2" maxlength="2000" data-mutate></textarea>
+            </label>
+            <div class="commit-row">
+              <button type="button" class="danger-ghost" id="cancelMergeBtn" data-mutate>Отменить слияние</button>
+              <button type="submit" class="primary" id="mergeCommitBtn" data-mutate>Завершить слияние</button>
+            </div>
+          </form>
+        </div>
+      </section>
+    </aside>
+  </main>
+
+  <div class="loading" id="loadingView">Подключение к серверу…</div>
+
+  <input type="file" id="hiddenRepoFile" accept=".vmrepo" hidden>
+
+  <dialog id="peerDialog">
+    <form method="dialog" class="dialog-body" id="peerForm">
+      <h2>Импорт репозитория</h2>
+      <p class="muted">Ветки из файла появятся как <code>имя/ветка</code>, например <code>bob/main</code>. Ваши ветки не изменятся.</p>
+      <label class="stack-field">
+        <span>Имя участника</span>
+        <input type="text" id="peerName" value="peer" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,39}" required spellcheck="false">
+      </label>
+      <p class="muted small" id="peerFileName"></p>
+      <div class="dialog-actions">
+        <button type="button" id="peerCancel">Отмена</button>
+        <button type="submit" class="primary" value="ok">Импортировать</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="confirmDialog">
+    <form method="dialog" class="dialog-body">
+      <h2 id="confirmTitle">Подтвердите действие</h2>
+      <p id="confirmText"></p>
+      <div class="dialog-actions">
+        <button type="submit" value="cancel" class="">Отмена</button>
+        <button type="submit" value="ok" class="danger" id="confirmOk">Подтвердить</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+</body>
+</html>
