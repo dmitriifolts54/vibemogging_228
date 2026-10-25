@@ -87,6 +87,26 @@ class MigrationTests(unittest.TestCase):
         print(f"\n[замер] legacy {report['before_bytes']} Б → compact {report['after_bytes']} Б, "
               f"кадров {report['frames']}, клипов {report['clips']}")
 
+    def test_original_source_and_v1_brightness_become_recipes(self):
+        legacy = Repository(self.root / "legacy-v1")
+        legacy.initialise(media.import_media(legacy.store, self.root / "source.mp4", compact=False), "source.mp4")
+        # V1 stored brighten/darken results as plain RGB objects (no LUT recipe).
+        manifest = legacy.manifest()
+        for index in range(5, 10):
+            table = maintenance.LUT_TABLES[index % 2]
+            manifest["video"][index] = legacy.store.put("video", legacy.store.get("video", manifest["video"][index]).translate(table))
+        legacy.set_working(manifest)
+        legacy.commit("V1 brightness")
+        target = self.root / "from-source"
+        report = maintenance.migrate(legacy.root, target, self.root / "source.mp4", store_factory=self.Store)
+        self.assertTrue(report["original_matched"])
+        self.assertEqual(report["recovered_luts"], 5)
+        self.assertEqual(report["packed"], 0)
+        self.assertEqual(report["verified_frames"], report["frames"])
+        compact = self.open_compact(target)
+        for ref in compact.manifest()["video"]:
+            self.assertEqual(compact.store.get("video", ref), legacy.store.get("video", ref))
+
     def test_existing_target_and_failures_leave_everything_untouched(self):
         target = self.root / "exists"
         target.mkdir()

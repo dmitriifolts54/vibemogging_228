@@ -326,6 +326,15 @@ class App:
             action = data["action"]
             if action in WORKSPACE_ACTIONS:
                 result = self._workspace_action(job_id, action, data)
+                if self.repo is not None:
+                    if action == "project_clone_cloud":
+                        self._update(job_id, progress=.9, message="Подготовка предпросмотра…")
+                        with self.repo.lock:
+                            try:
+                                result["preview_url"] = self.ensure_preview()
+                            except (UserError, OSError) as error:
+                                result["message"] += " Предпросмотр недоступен: " + str(error)
+                    self.storage = store_stats(self.repo)
                 self._update(job_id, status="done", progress=1, result=result)
                 return
             repo = self.require_repo()

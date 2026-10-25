@@ -192,6 +192,10 @@ def _copy(old, store, partial, original, progress, clip_frames, preset):
         report["original_matched"] = bool(covered)
         report["from_original"] = len(covered & set(raw))
     remaining = [ref for ref in raw if ref not in covered]
+    if covered and remaining:
+        recovered = _recover_luts(old, store, manifests, set(frames) - set(remaining), remaining, progress)
+        report["recovered_luts"] = len(recovered)
+        remaining = [ref for ref in remaining if ref not in recovered]
     workdir = partial / ".pack"
     workdir.mkdir()
     profile = {"width": width, "height": height, "fps": [fps.numerator, fps.denominator],
@@ -223,24 +227,64 @@ def _copy(old, store, partial, original, progress, clip_frames, preset):
     return report
 
 
+LUT_TABLES = [bytes(min(255, round(v * factor)) for v in range(256)) for factor in (1.2, .8)]
+
+
+def _recover_luts(old, store, manifests, known, pending, progress):
+    """Re-express V1 brighten/darken frames as LUT recipes over frames already available.
+
+    A raw frame qualifies only if applying the V1 table to the frame at the same
+    position of another version reproduces it byte for byte; repeated passes
+    cover stacked effects. Anything else is left for lossless packing.
+    """
+    known, pending, recovered = set(known), set(pending), set()
+    progress("Поиск кадров яркости, которые можно описать эффектом…", .06)
+    changed = True
+    while changed and pending:
+        changed = False
+        for manifest in manifests.values():
+            for index, ref in enumerate(manifest["video"]):
+                if ref not in pending:
+                    continue
+                bases = {other["video"][index] for other in manifests.values()
+                         if index < len(other["video"]) and other["video"][index] in known}
+                if not bases:
+                    continue
+                data = old.store.get("video", ref)
+                for base in bases:
+                    base_data = store.get("video", base)
+                    table = next((t for t in LUT_TABLES if base_data.translate(t) == data), None)
+                    if table is not None and store.put_video_lut(base, table, data) == ref:
+                        known.add(ref)
+                        pending.discard(ref)
+                        recovered.add(ref)
+                        changed = True
+                        break
+    return recovered
+
+
 def _use_original(old, store, partial, original, first, fps, progress):
     """Register the original file for the first version only if every frame ID matches."""
     if not original.is_file():
         raise UserError("Исходный видеофайл не найден.")
     progress("Сравнение с исходным видеофайлом…", .02)
-    with tempfile.TemporaryDirectory(dir=partial) as scratch:
-        trial = type(store)(Path(scratch))
-        try:
-            ids = media.decode_frames(trial, original, first["width"], first["height"], fps,
-                                      compact=True, normalization=1)
-        except UserError:
-            return set()
-        finally:
-            trial.close()
-    if ids != first["video"]:
-        return set()
-    ids = media.decode_frames(store, original, first["width"], first["height"], fps, compact=True, normalization=1)
-    return set(ids)
+    # V1 used the scale/fps pipeline of normalization 1; newer legacy-layout
+    # imports may use the bitexact profile 2. Accept whichever reproduces every ID.
+    for normalization in (1, 2):
+        with tempfile.TemporaryDirectory(dir=partial) as scratch:
+            trial = type(store)(Path(scratch))
+            try:
+                ids = media.decode_frames(trial, original, first["width"], first["height"], fps,
+                                          compact=True, normalization=normalization)
+            except UserError:
+                ids = None
+            finally:
+                trial.close()
+        if ids == first["video"]:
+            ids = media.decode_frames(store, original, first["width"], first["height"], fps,
+                                      compact=True, normalization=normalization)
+            return set(ids)
+    return set()
 
 
 def _verify(old, store, report, progress):

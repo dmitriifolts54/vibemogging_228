@@ -386,8 +386,11 @@ class CloudProject:
 
     def status(self):
         own = sorted((self.root / "devices" / self.device).glob("snapshot-*.json"), reverse=True)
+        record = self._read_record(own[0]) if own else None
         return {"connected": True, "folder": str(self.folder), "device": self.device,
                 "shared": str(self.root), "published": own[0].name if own else None,
+                "published_at": record["created"] if record else None,
+                "published_branches": record["snapshot"]["branches"] if record else None,
                 "devices": self.snapshots()}
 
 
