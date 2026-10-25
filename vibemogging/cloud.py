@@ -379,8 +379,9 @@ class CloudProject:
         cloning = not repo.state["project"]
         repo.install_snapshot(dict(snapshot), peer, progress=lambda p: progress(.5 + .5 * p))
         names = sorted(snapshot["branches"])
+        head = snapshot.get("head") if snapshot.get("head") in snapshot["branches"] else names[0]
         return {"device": peer, "branches": names if cloning else [f"{peer}/{name}" for name in names],
-                "fetched_bytes": fetched}
+                "head": head if cloning else f"{peer}/{head}", "fetched_bytes": fetched}
 
     # ----- status ----------------------------------------------------------------
 

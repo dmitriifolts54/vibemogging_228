@@ -432,3 +432,4 @@ dialog::backdrop { background: rgba(0, 0, 0, .6); }
   .project-actions { grid-row: auto; grid-column: 1; justify-content: flex-start; }
   .tab { font-size: 12px; padding: 10px 2px; }
 }
+.player-box img.loading { opacity: .45; transition: opacity .15s; }
