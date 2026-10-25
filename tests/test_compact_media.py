@@ -99,13 +99,14 @@ class CompactMediaTests(unittest.TestCase):
             self.assertEqual(restored.get("video", ref), self.compact.get("video", ref))
 
     def test_legacy_normalization_and_source_offset_reconstruct(self):
-        refs = media.decode_frames(self.compact, self.source, 160, 90, Fraction(10),
-                                    offset=.3, count=10, normalization=1)
-        old = media.decode_frames(self.legacy, self.source, 160, 90, Fraction(10),
-                                   offset=.3, count=10, compact=False, normalization=1)
-        self.assertEqual(refs, old)
-        for ref in refs:
-            self.assertEqual(self.compact.get("video", ref), self.legacy.get("video", ref))
+        for offset in (.3, .17):
+            refs = media.decode_frames(self.compact, self.source, 160, 90, Fraction(10),
+                                        offset=offset, count=10, normalization=1)
+            old = media.decode_frames(self.legacy, self.source, 160, 90, Fraction(10),
+                                       offset=offset, count=10, compact=False, normalization=1)
+            self.assertEqual(refs, old)
+            for ref in refs:
+                self.assertEqual(self.compact.get("video", ref), self.legacy.get("video", ref))
 
     def test_combined_replacement_is_atomic_on_missing_audio(self):
         manifest = media.import_media(self.compact, self.source)
@@ -163,6 +164,56 @@ class CompactMediaTests(unittest.TestCase):
         self.assertEqual(refs, manifest["video"])
         for ref in refs:
             self.assertEqual(destination.get("video", ref), self.legacy.get("video", ref))
+
+    def test_variable_frame_rate_source_is_exact_after_random_seeks(self):
+        source = self.path / "variable-frame-rate.mkv"
+        subprocess.run(media.command("-i", self.source, "-vf", "select=not(eq(mod(n\\,5)\\,1))",
+                                     "-fps_mode", "vfr", "-an", "-c:v", "libx264", "-g", "10", source),
+                       check=True, capture_output=True)
+        current = media.import_media(self.compact, source)
+        old = media.import_media(self.legacy, source, compact=False)
+        self.assertEqual(current, old)
+        count = len(current["video"])
+        for index in (count - 1, 0, count // 2, 2, count - 3, 1):
+            ref = current["video"][index]
+            self.assertEqual(self.compact.get("video", ref), self.legacy.get("video", ref))
+
+    def test_fractional_rate_and_subframe_offset_are_exact(self):
+        fps = Fraction(30000, 1001)
+        current = media.decode_frames(self.compact, self.source, 128, 72, fps, offset=.137, count=60)
+        old = media.decode_frames(self.legacy, self.source, 128, 72, fps, offset=.137, count=60, compact=False)
+        self.assertEqual(current, old)
+        for index in (59, 1, 28, 29, 30, 57, 0):
+            ref = current[index]
+            self.assertEqual(self.compact.get("video", ref), self.legacy.get("video", ref))
+
+    def test_verified_reimport_repairs_corrupted_asset(self):
+        manifest = self.import_pair()
+        ref = manifest["video"][30]
+        asset_id = self.compact.recipe(ref)["asset"]
+        self.compact.get("video", manifest["video"][0])
+        self.compact.asset_path(asset_id).write_bytes(b"damaged test asset")
+        with self.source.open("rb") as stream:
+            self.compact.import_asset(stream, asset_id, self.source.stat().st_size)
+        self.assertEqual(self.compact.get("video", ref), self.legacy.get("video", ref))
+
+    def test_existing_legacy_repository_is_not_modified_by_reading(self):
+        ref = self.legacy.put("video", b"\0" * 24)
+        before = sorted(p.relative_to(self.legacy.root) for p in self.legacy.root.rglob("*") if p.is_file())
+        self.assertEqual(self.legacy.get("video", ref), b"\0" * 24)
+        self.legacy.stats()
+        after = sorted(p.relative_to(self.legacy.root) for p in self.legacy.root.rglob("*") if p.is_file())
+        self.assertEqual(before, after)
+        self.assertFalse((self.legacy.root / "sources.sqlite3").exists())
+
+    def test_composed_effects_can_return_to_original_without_a_cycle(self):
+        original = self.compact.put("video", bytes([5]) * 24)
+        brighten = bytes(min(255, round(v * 1.2)) for v in range(256))
+        darken = bytes(round(v * .8) for v in range(256))
+        brighter = self.compact.put_video_lut(original, brighten)
+        restored = self.compact.put_video_lut(brighter, darken)
+        self.assertEqual(restored, original)
+        self.assertEqual(self.compact.get("video", restored), bytes([5]) * 24)
 
 
 if __name__ == "__main__":
