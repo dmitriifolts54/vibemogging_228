@@ -88,9 +88,9 @@ def mutation(method):
 
 
 class Repository:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, store: Store | None = None):
         self.root = Path(root).resolve()
-        self.store = Store(self.root)
+        self.store = store if store is not None else Store(self.root)
         self.lock = threading.RLock()
         self.pixel_resolver = None
         state_file = self.root / "state.json"
