@@ -43,13 +43,13 @@ def write_audio(store: Store, manifest: dict, start_byte: int, data: bytes):
         manifest["audio"][index] = store.put("audio", bytes(block))
 
 
-def ranges(indices):
-    """Coalesce sorted integer positions into half-open ranges."""
+def ranges(indices, max_gap=0):
+    """Coalesce sorted positions, optionally grouping short gaps for display."""
     start = previous = None
     for value in indices:
         if start is None:
             start = previous = value
-        elif value == previous + 1:
+        elif value <= previous + 1 + max_gap:
             previous = value
         else:
             yield start, previous + 1
@@ -108,7 +108,10 @@ def merge_manifests(store: Store, base: dict, ours: dict, theirs: dict,
         result["audio"][index] = store.put("audio", bytes(merged))
     conflicts = []
     for kind, positions in (("video", video_conflicts), ("audio", audio_conflicts)):
-        for start, end in ranges(positions):
+        # Group short zero crossings / unchanged stereo channels into one manual
+        # audio choice. Resolution still touches only actually conflicting values.
+        gap = SAMPLE_RATE * CHANNELS // 100 if kind == "audio" else 0
+        for start, end in ranges(positions, max_gap=gap):
             conflicts.append({"id": f"{kind}:{start}:{end}", "kind": kind,
                               "start": start, "end": end, "choice": None})
     return result, conflicts

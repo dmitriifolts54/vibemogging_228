@@ -28,10 +28,14 @@ STATIC = Path(__file__).parent / "static"
 class App:
     def __init__(self, root: Path):
         self.directory_lock = DirectoryLock(Path(root))
-        self.repo = Repository(root)
-        self.root = self.repo.root
-        for directory in ("uploads", "preview", "bundles"):
-            (self.root / directory).mkdir(exist_ok=True)
+        try:
+            self.repo = Repository(root)
+            self.root = self.repo.root
+            for directory in ("uploads", "preview", "bundles"):
+                (self.root / directory).mkdir(exist_ok=True)
+        except Exception:
+            self.directory_lock.close()
+            raise
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="media")
         self.jobs = {}
         self.job_lock = threading.Lock()
@@ -162,7 +166,7 @@ class App:
                     try:
                         result["preview_url"] = self.ensure_preview(
                             progress=lambda p: self._update(job_id, progress=.67 + .32 * p))
-                    except UserError as error:
+                    except (UserError, OSError) as error:
                         # Editing and committing remain valid even if an optional MP4 preview fails.
                         result["message"] += " Предпросмотр недоступен: " + str(error)
                 self._update(job_id, status="done", progress=1, result=result)

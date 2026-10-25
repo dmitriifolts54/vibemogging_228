@@ -4,6 +4,7 @@ from pathlib import Path
 import struct
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 from vibemogging.media import edit_media, interval
@@ -237,6 +238,69 @@ class RepositoryTests(unittest.TestCase):
             self.repo.branch("../escape")
         with self.assertRaises(UserError):
             self.repo.branch("working")
+
+    def test_failed_save_restores_memory_and_disk_state(self):
+        previous = deepcopy(self.repo.state)
+        with patch("vibemogging.storage.os.replace", side_effect=OSError("disk full")):
+            with self.assertRaises(UserError):
+                self.repo.branch("failed")
+        self.assertEqual(self.repo.state, previous)
+        self.assertEqual(Repository(self.root / "a").state, previous)
+        self.assertFalse(list((self.root / "a").glob(".write-*")))
+
+    def test_failed_initial_import_does_not_leave_partial_project(self):
+        empty = Repository(self.root / "empty")
+        previous = deepcopy(empty.state)
+        with patch.object(empty.store, "put_json", side_effect=OSError("disk full")):
+            with self.assertRaises(UserError):
+                empty.initialise(self.base, "failed")
+        self.assertEqual(empty.state, previous)
+        self.assertIsNone(empty.status()["project"])
+
+    def test_pending_merge_survives_restart_and_can_complete(self):
+        self.repo.branch("other")
+        self.video_edit(0, 1, [200, 0, 0])
+        self.repo.commit("A")
+        self.repo.checkout("main")
+        self.video_edit(0, 1, [0, 0, 200])
+        self.repo.commit("B")
+        self.repo.merge("other")
+        reloaded = Repository(self.root / "a")
+        conflict = reloaded.status()["merge"]["conflicts"][0]
+        reloaded.resolve(conflict["id"], "theirs")
+        reloaded.commit("resolved after restart")
+        self.assertIsNone(reloaded.state["merge"])
+        self.assertEqual(reloaded.manifest(), reloaded.manifest("other"))
+
+    def test_corrupt_metadata_is_reported_without_reinitialisation(self):
+        state_file = self.root / "a" / "state.json"
+        state_file.write_text('{"format":1,"branches":[]}', encoding="utf-8")
+        previous = state_file.read_bytes()
+        with self.assertRaises(UserError):
+            Repository(self.root / "a")
+        self.assertEqual(state_file.read_bytes(), previous)
+
+    def test_grouped_audio_choice_preserves_independent_samples_in_gaps(self):
+        self.repo.branch("alice")
+        a = self.repo.manifest()
+        for offset, value in ((4, 2000), (40, 2000), (20, 2222)):
+            write_audio(self.repo.store, a, offset, struct.pack("<h", value))
+        self.repo.set_working(a)
+        self.repo.commit("Alice")
+        self.repo.checkout("main")
+        b = self.repo.manifest()
+        for offset, value in ((4, 3000), (40, 3000), (30, 3333)):
+            write_audio(self.repo.store, b, offset, struct.pack("<h", value))
+        self.repo.set_working(b)
+        self.repo.commit("Bob")
+        self.repo.merge("alice")
+        conflicts = self.repo.state["merge"]["conflicts"]
+        self.assertEqual(len(conflicts), 1)
+        self.repo.resolve(conflicts[0]["id"], "base")
+        self.repo.commit("Resolve grouped region")
+        result = self.repo.manifest()
+        for offset, expected in ((4, 1000), (40, 1000), (20, 2222), (30, 3333)):
+            self.assertEqual(read_audio(self.repo.store, result, offset, offset + 2), struct.pack("<h", expected))
 
 
 if __name__ == "__main__":

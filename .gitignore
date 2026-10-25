@@ -4,4 +4,5 @@ __pycache__/
 .vibemogging/
 *.vmrepo
 exports/
+demo-data/
 .DS_Store

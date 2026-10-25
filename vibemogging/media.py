@@ -55,9 +55,11 @@ def read_exact(stream, count):
 def decode_frames(store: Store, path: Path, width: int, height: int, fps: Fraction,
                   offset=0, count=None, progress=lambda value: None):
     filters = (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-               f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps.numerator}/{fps.denominator},"
+               f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps.numerator}/{fps.denominator}:start_time=0,"
                "setsar=1")
-    args = command("-ss", offset, "-i", path, "-map", "0:v:0", "-an", "-vf", filters,
+    # Output seeking decodes from the beginning. Input seeking can skip early
+    # audio when the first video keyframe is delayed relative to the soundtrack.
+    args = command("-i", path, "-ss", offset, "-map", "0:v:0", "-an", "-vf", filters,
                    "-pix_fmt", "rgb24")
     if count is not None:
         args += ["-frames:v", str(count)]
@@ -96,7 +98,7 @@ def decode_audio(path: Path, target: Path, duration: float, offset=0, required=F
             raise UserError("В выбранном файле нет звука.")
         target.write_bytes(b"")
         return
-    process = subprocess.run(command("-ss", offset, "-i", path, "-map", "0:a:0", "-vn",
+    process = subprocess.run(command("-i", path, "-ss", offset, "-map", "0:a:0", "-vn",
                                       "-af", "aresample=48000:async=1:first_pts=0",
                                       "-t", f"{duration:.12f}", "-ar", SAMPLE_RATE,
                                       "-ac", CHANNELS, "-acodec", "pcm_s16le", "-f", "s16le", target),

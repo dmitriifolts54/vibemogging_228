@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timezone
-from functools import lru_cache
+from functools import lru_cache, wraps
 import json
 from pathlib import Path
 import re
@@ -17,6 +17,22 @@ from .merge import (AUDIO_BLOCK, CHANNELS, FRAME_BYTES, SAMPLE_RATE, diff_manife
 from .storage import Store, UserError, atomic_write, canonical, digest, valid_id
 
 
+def mutation(method):
+    """Restore in-memory state if a mutation fails before its atomic save."""
+    @wraps(method)
+    def run(self, *args, **kwargs):
+        with self.lock:
+            previous = deepcopy(self.state)
+            try:
+                return method(self, *args, **kwargs)
+            except Exception as error:
+                self.state = previous
+                if isinstance(error, OSError):
+                    raise UserError("Не удалось сохранить данные. Проверьте свободное место и доступ к папке репозитория.") from error
+                raise
+    return run
+
+
 class Repository:
     def __init__(self, root: Path):
         self.root = Path(root).resolve()
@@ -25,11 +41,46 @@ class Repository:
         self.pixel_resolver = None
         state_file = self.root / "state.json"
         if state_file.exists():
-            self.state = json.loads(state_file.read_text())
+            try:
+                self.state = json.loads(state_file.read_text(encoding="utf-8"))
+                self._validate_state()
+            except (ValueError, KeyError, TypeError, AttributeError) as error:
+                raise UserError("Не удалось прочитать state.json: повреждены метаданные репозитория. Сохраните копию папки данных для восстановления.") from error
         else:
             self.state = {"format": 1, "project": None, "head": "main", "branches": {},
                           "drafts": {}, "merge": None, "incoming": []}
         self.state.setdefault("incoming", [])
+
+    def _validate_state(self):
+        state = self.state
+        if state["format"] != 1 or not isinstance(state["branches"], dict) or not isinstance(state["drafts"], dict):
+            raise ValueError("Invalid repository state")
+        if not isinstance(state["head"], str):
+            raise ValueError("Invalid current branch")
+        for name, ref in state["branches"].items():
+            self.branch_name(name)
+            if not valid_id(ref):
+                raise ValueError("Invalid branch ref")
+        for name, ref in state["drafts"].items():
+            if name not in state["branches"] or not valid_id(ref):
+                raise ValueError("Invalid draft")
+        if state["project"] is None:
+            if state["branches"] or state["drafts"] or state["merge"]:
+                raise ValueError("Uninitialised repository has refs")
+        elif (not isinstance(state["project"], dict) or state["head"] not in state["branches"] or
+              not re.fullmatch(r"[0-9a-f]{32}", str(state["project"].get("id", ""))) or
+              not isinstance(state["project"].get("name"), str)):
+            raise ValueError("Invalid project")
+        incoming = state.get("incoming", [])
+        if not isinstance(incoming, list) or not all(isinstance(name, str) and name in state["branches"] for name in incoming):
+            raise ValueError("Invalid incoming refs")
+        pending = state["merge"]
+        if pending is not None and (not isinstance(pending, dict) or
+                                    not valid_id(pending.get("base")) or
+                                    not isinstance(pending.get("parents"), list) or len(pending["parents"]) != 2 or
+                                    not all(valid_id(ref) for ref in pending["parents"]) or
+                                    not isinstance(pending.get("conflicts"), list)):
+            raise ValueError("Invalid pending merge")
 
     def save(self):
         atomic_write(self.root / "state.json", canonical(self.state))
@@ -57,6 +108,7 @@ class Repository:
     def manifest(self, ref="working"):
         return self.store.get_json("manifest", self.manifest_id(ref))
 
+    @mutation
     def set_working(self, manifest):
         self.state["drafts"][self.state["head"]] = self.store.put_json("manifest", manifest)
         self.save()
@@ -64,6 +116,7 @@ class Repository:
     def dirty(self):
         return bool(self.head and self.manifest_id() != self.get_commit(self.head)["manifest"])
 
+    @mutation
     def initialise(self, manifest, name):
         if self.state["project"]:
             raise UserError("В этой папке уже есть проект. Для нового используйте другой --data-dir.")
@@ -71,6 +124,7 @@ class Repository:
         self.state["drafts"]["main"] = self.store.put_json("manifest", manifest)
         return self.commit("Первый импорт")
 
+    @mutation
     def commit(self, message, author="Local editor"):
         message = str(message).strip()
         if not message:
@@ -109,6 +163,7 @@ class Repository:
             raise UserError("Имя working зарезервировано.")
         return name
 
+    @mutation
     def branch(self, name):
         self.assert_no_merge()
         if not self.head:
@@ -123,6 +178,7 @@ class Repository:
         self.state["head"] = name
         self.save()
 
+    @mutation
     def checkout(self, name):
         self.assert_no_merge()
         if name not in self.state["branches"]:
@@ -130,11 +186,13 @@ class Repository:
         self.state["head"] = name
         self.save()
 
+    @mutation
     def restore(self, ref):
         self.assert_no_merge()
         self.state["drafts"][self.state["head"]] = self.manifest_id(ref)
         self.save()
 
+    @mutation
     def discard(self):
         self.assert_no_merge()
         self.state["drafts"].pop(self.state["head"], None)
@@ -159,6 +217,7 @@ class Repository:
             raise UserError("Несколько общих баз слияния: такой граф пока не поддерживается в V1.")
         return best.pop()
 
+    @mutation
     def merge(self, source):
         self.assert_clean()
         if source not in self.state["branches"]:
@@ -183,6 +242,7 @@ class Repository:
         self.save()
         return {"mode": "conflicts", "message": f"Нужно разрешить конфликтов: {len(conflicts)}."}
 
+    @mutation
     def resolve(self, conflict_id, choice):
         pending = self.state["merge"]
         if not pending or choice not in {"base", "ours", "theirs"}:
@@ -197,12 +257,25 @@ class Repository:
         if conflict["kind"] == "video":
             result["video"][start:end] = source["video"][start:end]
         else:
-            data = read_audio(self.store, source, start * 2, end * 2)
-            write_audio(self.store, result, start * 2, data)
+            original = self.manifest(pending["base"])
+            ours = self.manifest(pending["parents"][0])
+            theirs = self.manifest(pending["parents"][1])
+            for begin in range(start * 2, end * 2, AUDIO_BLOCK * FRAME_BYTES):
+                finish = min(end * 2, begin + AUDIO_BLOCK * FRAME_BYTES)
+                base_data, left_data, right_data = (
+                    read_audio(self.store, manifest, begin, finish) for manifest in (original, ours, theirs))
+                selected = {"base": base_data, "ours": left_data, "theirs": right_data}[choice]
+                data = bytearray(read_audio(self.store, result, begin, finish))
+                for offset in range(0, len(data), 2):
+                    bv, av, cv = (chunk[offset:offset + 2] for chunk in (base_data, left_data, right_data))
+                    if av != cv and av != bv and cv != bv:
+                        data[offset:offset + 2] = selected[offset:offset + 2]
+                write_audio(self.store, result, begin, bytes(data))
         conflict["choice"] = choice
         self.state["drafts"][self.state["head"]] = self.store.put_json("manifest", result)
         self.save()
 
+    @mutation
     def cancel_merge(self):
         if not self.state["merge"]:
             raise UserError("Сейчас нет незавершённого слияния.")
@@ -279,6 +352,7 @@ class Repository:
         finally:
             temporary.unlink(missing_ok=True)
 
+    @mutation
     def import_bundle(self, path: Path, peer="peer"):
         self.assert_no_merge()
         peer = self.branch_name(peer)

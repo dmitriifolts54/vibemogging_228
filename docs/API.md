@@ -76,6 +76,9 @@ Use `start_time` / `end_time` in the UI. Raw audio `start` / `end` are scalar
 PCM sample indices, not seconds. Choices are null, `base`, `ours`, or `theirs`.
 All conflicts must have a choice before committing the merge. Before resolution,
 preview uses ours on conflicting positions and includes independent changes.
+Audio conflicts separated by gaps up to 10 ms may be presented as one region.
+Choosing a variant changes only genuinely conflicting PCM values inside it;
+independent changes within the region remain intact.
 
 ### POST /api/upload?name=filename.mp4
 

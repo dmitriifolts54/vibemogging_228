@@ -92,6 +92,18 @@ class MediaIntegrationTests(unittest.TestCase):
         second = DirectoryLock(path)
         second.close()
 
+    def test_video_start_offset_keeps_audio_timeline(self):
+        source = self.root / "delayed-video.mkv"
+        subprocess.run(media.command("-itsoffset", "1", "-f", "lavfi", "-i", "color=c=blue:s=16x16:r=2:d=1",
+                                     "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2",
+                                     "-c:v", "ffv1", "-c:a", "pcm_s16le", "-t", "2", source),
+                       check=True, capture_output=True)
+        store = Store(self.root / "delayed-video-store")
+        manifest = media.import_media(store, source)
+        self.assertEqual(len(manifest["video"]), 4)
+        self.assertEqual(manifest["samples"], 2 * SAMPLE_RATE)
+        self.assertTrue(any(read_audio(store, manifest, 0, 1000)), "Early soundtrack was lost")
+
     def test_real_http_upload_job_edit_export_and_ranges(self):
         server = make_server(self.root / "http-repo", port=0)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -148,6 +160,25 @@ class MediaIntegrationTests(unittest.TestCase):
             status, _, wav = request("GET", "/api/audio?start=0&end=1")
             self.assertEqual(status, 200)
             self.assertTrue(wav.startswith(b"RIFF"))
+            action({"action": "branch", "name": "teammate"})
+            action({"action": "edit", "operation": "fill", "start": 0, "end": 1, "value": "#ffee00"})
+            action({"action": "commit", "message": "incoming yellow"})
+            action({"action": "checkout", "name": "main"})
+            action({"action": "edit", "operation": "fill", "start": 0, "end": 1, "value": "#008800"})
+            action({"action": "commit", "message": "local green"})
+            self.assertEqual(action({"action": "merge", "source": "teammate"})["mode"], "conflicts")
+            _, _, raw = request("GET", "/api/status")
+            conflicts = json.loads(raw)["merge"]["conflicts"]
+            self.assertEqual(len(conflicts), 1)
+            action({"action": "resolve", "conflict": conflicts[0]["id"], "choice": "theirs"})
+            action({"action": "commit", "message": "resolved yellow"})
+            _, _, raw = request("GET", "/api/diff?left=teammate&right=main")
+            self.assertEqual(json.loads(raw)["video_frames"], 0)
+            result = action({"action": "bundle_export"})
+            status, headers, bundle = request("GET", result["download_url"])
+            self.assertEqual(status, 200)
+            self.assertIn("attachment", headers["Content-Disposition"])
+            self.assertTrue(bundle.startswith(b"PK"))
             status, _, _ = request("POST", "/api/action", '{"action":"discard"}',
                                     {"Content-Type": "application/json", "Origin": "https://unrelated.example"})
             self.assertEqual(status, 403)
