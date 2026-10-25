@@ -200,6 +200,22 @@ class BundleFormatTests(unittest.TestCase):
             Repository(self.root / "x").import_bundle(bad)
 
 
+class PreviewCacheTests(unittest.TestCase):
+    def test_least_recently_used_files_are_removed_first(self):
+        import os
+        from vibemogging.server import trim_preview_cache
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for number, name in enumerate(["old", "middle", "keep", "new"]):
+                path = root / f"{name}.mp4"
+                path.write_bytes(b"x" * 100)
+                os.utime(path, (1000 + number, 1000 + number))
+            (root / "notes.txt").write_text("not a preview")
+            stats = trim_preview_cache(root, 250, keep={"keep.mp4"})
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["keep.mp4", "new.mp4", "notes.txt"])
+            self.assertEqual((stats["preview_bytes"], stats["preview_removed"]), (200, 2))
+
+
 class WorkspaceTests(unittest.TestCase):
     def test_create_list_reopen_and_register_legacy(self):
         with tempfile.TemporaryDirectory() as directory:

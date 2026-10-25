@@ -111,6 +111,23 @@ class WorkspaceHttpTests(unittest.TestCase):
         merged = self.ok(port, action="merge", source="pc2/main")
         self.assertEqual(merged["mode"], "fast-forward")
 
+    def test_preview_cache_is_bounded(self):
+        server = make_server(self.root / "cached", port=0, preview_cache=1)
+        self.servers.append(server)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        port = server.server_address[1]
+        self.ok(port, action="import", upload=self.upload(port, self.source), name="clip.mp4")
+        for second in (0, 1):
+            self.ok(port, action="edit", operation="fill", start=second, end=second + 1, value="#00ff00")
+        export = self.ok(port, action="export")
+        previews = list((self.root / "cached" / "preview").glob("*.mp4"))
+        _, status = self.request(port, "GET", "/api/status")
+        self.assertEqual([p.name for p in previews], [f"{status['manifest']}.mp4"],
+                         "older previews are evicted; the current one stays")
+        self.assertEqual(status["preview_cache"]["preview_files"], 1)
+        code, _ = self.request(port, "GET", export["download_url"])
+        self.assertEqual(code, 200)
+
     def test_single_directory_mode_has_no_chooser(self):
         server = make_server(self.root / "single", port=0)
         self.servers.append(server)

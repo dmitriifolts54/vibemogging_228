@@ -9,6 +9,7 @@ import io
 import json
 import mimetypes
 from pathlib import Path
+import os
 import re
 import shutil
 import threading
@@ -31,6 +32,36 @@ WORKSPACE_ACTIONS = {"project_create", "project_open", "project_close", "project
                      "project_register", "project_migrate", "project_clone_cloud"}
 
 
+DEFAULT_PREVIEW_CACHE = 1024 * 1024 * 1024
+
+
+def trim_preview_cache(directory: Path, limit: int, keep=()) -> dict:
+    """Disposable MP4 previews/exports: drop least recently used files above `limit` bytes.
+
+    Previews are rebuilt from the canonical history on demand, so evicting them
+    never loses data. Files in `keep` (current working preview, the file just
+    rendered) are never removed.
+    """
+    files = []
+    for path in directory.glob("*.mp4"):
+        try:
+            files.append((path.stat().st_mtime, path.stat().st_size, path))
+        except OSError:
+            continue
+    total = sum(size for _, size, _ in files)
+    removed = 0
+    for _, size, path in sorted(files):
+        if total <= limit:
+            break
+        if path.name in keep:
+            continue
+        path.unlink(missing_ok=True)
+        total -= size
+        removed += 1
+    return {"preview_bytes": total, "preview_files": len(files) - removed, "preview_limit": limit,
+            "preview_removed": removed}
+
+
 def store_stats(repo: Repository):
     if hasattr(repo.store, "stats"):
         try:
@@ -45,14 +76,16 @@ def store_stats(repo: Repository):
 class App:
     """One server process: either a single `--data-dir` project or a workspace of projects."""
 
-    def __init__(self, root: Path | None = None, workspace: Workspace | None = None, store_factory=Store):
+    def __init__(self, root: Path | None = None, workspace: Workspace | None = None, store_factory=Store,
+                 preview_cache=DEFAULT_PREVIEW_CACHE):
         if (root is None) == (workspace is None):
             raise ValueError("Pass exactly one of root or workspace")
         self.workspace = workspace
         self.store_factory = store_factory
+        self.preview_cache = preview_cache
         self.workspace_lock = DirectoryLock(workspace.root) if workspace else None
         self.repo = self.root = self.directory_lock = self.entry = None
-        self.storage = None
+        self.storage = self.preview_stats = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="media")
         self.jobs = {}
         self.job_lock = threading.Lock()
@@ -81,6 +114,7 @@ class App:
             raise
         self.repo, self.root, self.directory_lock, self.entry = repo, repo.root, lock, entry
         self.storage = store_stats(repo)
+        self.preview_stats = trim_preview_cache(repo.root / "preview", self.preview_cache)
         if self.workspace and entry:
             self.workspace.touch(entry["id"], self.storage)
 
@@ -96,7 +130,7 @@ class App:
             self.repo.store.close()
         self.directory_lock.close()
         self.repo = self.root = self.directory_lock = self.entry = None
-        self.storage = None
+        self.storage = self.preview_stats = None
         with self.job_lock:
             self.snapshot = {"project": None, "ffmpeg": media.tools_available(), "busy": self.active is not None}
 
@@ -145,6 +179,7 @@ class App:
             result.update(self.context())
             result["ffmpeg"] = media.tools_available()
             result["storage"] = self.storage
+            result["preview_cache"] = self.preview_stats
             try:
                 cloud = CloudProject.load(repo)
                 result["cloud"] = {"connected": bool(cloud), "device": cloud.device if cloud else None,
@@ -213,6 +248,10 @@ class App:
         path = self.root / "preview" / f"{manifest_id}.mp4"
         if not path.exists():
             media.render(self.repo.store, self.repo.manifest(ref), path, progress)
+        else:
+            os.utime(path)  # most recently used
+        keep = {path.name, f"{self.repo.manifest_id()}.mp4"}
+        self.preview_stats = trim_preview_cache(self.root / "preview", self.preview_cache, keep)
         return f"/media/preview/{manifest_id}.mp4"
 
     def _workspace_action(self, job_id, action, data):
@@ -489,7 +528,13 @@ class Handler(BaseHTTPRequestHandler):
                 _, kind, name = parts
                 self.app.require_repo()
                 if kind == "preview" and name.endswith(".mp4") and valid_id(name[:-4]):
-                    self.send_file(self.app.root / kind / name, "video/mp4", bool(query.get("download")))
+                    target = self.app.root / kind / name
+                    if target.is_file():
+                        try:
+                            os.utime(target)  # keeps a watched preview out of LRU eviction
+                        except OSError:
+                            pass
+                    self.send_file(target, "video/mp4", bool(query.get("download")))
                 elif kind == "bundles" and re.fullmatch(r"[a-f0-9]{32}\.vmrepo", name):
                     self.send_file(self.app.root / kind / name, "application/zip", True)
                 else:
@@ -624,11 +669,12 @@ class LocalServer(ThreadingHTTPServer):
         super().server_close()
 
 
-def make_server(root: Path | None = None, port=8765, workspace: Path | None = None, store_factory=Store):
+def make_server(root: Path | None = None, port=8765, workspace: Path | None = None, store_factory=Store,
+                preview_cache=DEFAULT_PREVIEW_CACHE):
     """`root` opens one project folder (legacy --data-dir); `workspace` shows the project list."""
     server = LocalServer(("127.0.0.1", port), Handler)
     try:
-        server.app = App(root, Workspace(workspace) if workspace else None, store_factory)
+        server.app = App(root, Workspace(workspace) if workspace else None, store_factory, preview_cache)
     except Exception:
         server.server_close()
         raise
