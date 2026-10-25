@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+.vibemogging/
+*.vmrepo
+exports/
+.DS_Store
