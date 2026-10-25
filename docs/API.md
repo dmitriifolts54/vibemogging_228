@@ -144,6 +144,8 @@ Edit operations:
 - `fill`: `value` is a color such as `#22aa88`.
 - `mute`: no upload.
 - `gain`: `value` is linear gain from 0 to 4 (`1` means unchanged).
+- `replace_av`: `upload` required; replaces video AND audio of the range from one
+  file (frame-aligned bounds). If either track fails, the working version is unchanged.
 
 Imported replacements are scaled/letterboxed to the project resolution and
 resampled to project FPS / 48 kHz stereo. Too-short replacements are rejected.
@@ -171,6 +173,65 @@ Useful for comparing audio in a conflict / history comparison.
 Supports HTTP byte ranges for native `<video controls>`. Export job returns a
 download URL pointing to this file with an attachment query. Bundles are served
 from `/media/bundles/TOKEN.vmrepo` with attachment disposition.
+
+## Projects, cloud folder and compact exchange (iteration 2)
+
+Implemented on `feature/compact-projects-cloud`. Details and measurements:
+[PROJECTS_CLOUD.md](PROJECTS_CLOUD.md).
+
+### Server modes
+
+- `python3 -m vibemogging` — workspace mode: a project list stored in
+  `~/Vibemogging/workspace.json` (local to this computer; `--workspace DIR` to change).
+  A V1 `./.vibemogging` folder is added to the list automatically.
+- `python3 -m vibemogging --data-dir DIR` — single project, as in V1. Project
+  actions return an error in this mode.
+- `--preview-cache-mb N` (default 1024) bounds disposable MP4 previews/exports per project.
+
+`/api/status` additionally returns `mode` (`workspace`|`single`), `open` (a project
+folder is open), `workspace_project` (`{id, name}` or null), `data_dir`,
+`storage` (`Store.stats()` plus `folder_bytes`), `preview_cache`
+(`preview_bytes`, `preview_files`, `preview_limit`) and `cloud`
+(`{connected, device, folder}`). With `open: false` every media route answers 400.
+
+### GET /api/projects
+
+`{"root": "...", "current": id|null, "projects": [{id, name, path, created,
+opened, storage, available, initialised, video_name, cloud, legacy}]}`.
+`legacy: true` means V1 frame storage (candidate for a compact copy).
+
+### GET /api/cloud and GET /api/cloud/projects?folder=ABS_PATH
+
+`/api/cloud` (open project): `{connected, folder, device, shared, published,
+published_at, published_branches, devices: [{device, snapshots, unreadable?,
+latest: {file, created, branches, complete, missing_files, missing_bytes,
+received}}]}`. It reads the shared folder, so call it on demand, not in a tight loop.
+`/api/cloud/projects` lists shared projects in a folder: `[{id, name, devices}]`.
+
+### Additional actions
+
+| Action | Arguments | Behavior |
+| --- | --- | --- |
+| `project_create` | `name` | Create a project folder in the workspace and open it |
+| `project_open` | `id` | Close the current project (`store.close()`), open another |
+| `project_close` | none | Return to the project list |
+| `project_forget` | `id` | Remove from the list; the folder is NOT deleted |
+| `project_register` | `path` (absolute) | Add an existing data folder without moving it |
+| `project_migrate` | `id`, optional `source_media` (absolute path) | Copy a closed project into a NEW compact folder; result has `report` |
+| `project_clone_cloud` | `folder`, `project`, `source_device`, `device`, optional `name` | New local project from another device's latest complete snapshot |
+| `cloud_connect` | `folder` (absolute), `device` | Attach the open project to a cloud-client folder |
+| `cloud_disconnect` | none | Detach; shared files stay |
+| `cloud_publish` | none | Copy missing files, then write this device's snapshot; result has `copied`, `skipped`, `copied_bytes`, `branches` |
+| `cloud_receive` | `device` | Install that device's latest complete snapshot as `device/BRANCH` refs; merging stays explicit |
+
+### `.vmrepo` format 2
+
+ZIP entries: `index.json` (`format: 2`, `project`, `branches`, `head`, `objects`
+list, `assets` `{id: size}`), `recipes.json` (`{raw video id: recipe}`),
+`objects/<kind>/<id>` for ordinary objects and `assets/<id>` (ZIP_STORED, streamed)
+for compressed sources. Export never materialises recipe frames to RGB. Import
+accepts format 1 and 2, verifies digests, assets and every reconstructed frame ID,
+and changes refs only after the whole snapshot validates.
 
 ## Suggested UI scope
 

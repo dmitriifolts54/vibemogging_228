@@ -1,4 +1,4 @@
-"""Streaming FFmpeg adapters. Repository media is always lossless RGB/PCM."""
+"""Streaming FFmpeg adapters; source-backed video, exact RGB identities and PCM."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ import zlib
 
 from .merge import AUDIO_BLOCK, CHANNELS, FRAME_BYTES, SAMPLE_RATE, read_audio, write_audio
 from .storage import Store, UserError
+from .video_sources import video_command
 
 
 def tools_available():
@@ -53,17 +54,11 @@ def read_exact(stream, count):
 
 
 def decode_frames(store: Store, path: Path, width: int, height: int, fps: Fraction,
-                  offset=0, count=None, progress=lambda value: None):
-    filters = (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-               f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps.numerator}/{fps.denominator}:start_time=0,"
-               "setsar=1")
-    # Output seeking decodes from the beginning. Input seeking can skip early
-    # audio when the first video keyframe is delayed relative to the soundtrack.
-    args = command("-i", path, "-ss", offset, "-map", "0:v:0", "-an", "-vf", filters,
-                   "-pix_fmt", "rgb24")
-    if count is not None:
-        args += ["-frames:v", str(count)]
-    args += ["-f", "rawvideo", "pipe:1"]
+                  offset=0, count=None, progress=lambda value: None, *, compact=True, normalization=2):
+    profile = {"width": width, "height": height, "fps": [fps.numerator, fps.denominator],
+               "offset": float(offset), "normalization": normalization}
+    asset_id = store.add_asset(path) if compact else None
+    args = video_command(store.asset_path(asset_id) if compact else path, profile, count=count)
     frames = []
     with tempfile.TemporaryFile() as errors:
         process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=errors)
@@ -74,7 +69,9 @@ def decode_frames(store: Store, path: Path, width: int, height: int, fps: Fracti
                     break
                 if len(frame) != width * height * 3:
                     raise UserError("FFmpeg вернул неполный кадр.")
-                frames.append(store.put("video", frame))
+                ref = (store.register_source_frame(asset_id, profile, len(frames), frame) if compact
+                       else store.put("video", frame))
+                frames.append(ref)
                 progress(len(frames))
             if process.wait() != 0:
                 errors.seek(0)
@@ -84,6 +81,7 @@ def decode_frames(store: Store, path: Path, width: int, height: int, fps: Fracti
             if process.poll() is None:
                 process.kill()
                 process.wait()
+            store.flush()
     if count is not None and len(frames) != count:
         raise UserError("Видео для замены короче выбранного диапазона. Выберите более длинный фрагмент.")
     if not frames:
@@ -107,11 +105,13 @@ def decode_audio(path: Path, target: Path, duration: float, offset=0, required=F
         raise UserError("Не удалось декодировать звук: " + process.stderr[:1000].decode(errors="replace"))
 
 
-def import_media(store: Store, path: Path, progress=lambda value: None):
+def import_media(store: Store, path: Path, progress=lambda value: None, *, compact=True):
     metadata = probe(path)
     video = next((s for s in metadata["streams"] if s["codec_type"] == "video"), None)
     if video is None:
         raise UserError("Для создания проекта нужен файл с видео.")
+    if compact:
+        path = store.asset_path(store.add_asset(path))
     width, height = int(video["width"]), int(video["height"])
     rotation = next((int(d.get("rotation", 0)) for d in video.get("side_data_list", [])
                      if "rotation" in d), 0)
@@ -129,7 +129,7 @@ def import_media(store: Store, path: Path, progress=lambda value: None):
         fps = Fraction(30)
     estimate = float(metadata.get("format", {}).get("duration", 1)) * float(fps)
     frames = decode_frames(store, path, width, height, fps,
-                           progress=lambda n: progress(min(.8, n / max(estimate, 1) * .8)))
+                           progress=lambda n: progress(min(.8, n / max(estimate, 1) * .8)), compact=compact)
     sample_count = round(Fraction(len(frames), 1) / fps * SAMPLE_RATE)
     chunks = []
     with tempfile.TemporaryDirectory() as directory:
@@ -168,7 +168,7 @@ def edit_media(store: Store, manifest: dict, operation: str, start, end, source:
                offset=0, value=None, progress=lambda value: None):
     result = deepcopy(manifest)
     if not isinstance(operation, str) or operation not in {
-            "replace_video", "replace_audio", "brighten", "darken", "fill", "mute", "gain"}:
+            "replace_video", "replace_audio", "replace_av", "brighten", "darken", "fill", "mute", "gain"}:
         raise UserError("Неизвестная операция редактирования.")
     try:
         offset = float(offset)
@@ -176,6 +176,16 @@ def edit_media(store: Store, manifest: dict, operation: str, start, end, source:
         raise UserError("Некорректное смещение источника.") from error
     if not math.isfinite(offset) or offset < 0:
         raise UserError("Смещение источника должно быть неотрицательным.")
+    if operation == "replace_av":
+        first, last = interval(manifest, start, end, video=True)
+        if source is not None:
+            source = store.asset_path(store.add_asset(source))
+        fps = manifest["fps"][0] / manifest["fps"][1]
+        start, end = first / fps, last / fps
+        result = edit_media(store, result, "replace_video", start, end, source, offset,
+                            progress=lambda p: progress(p * .7))
+        return edit_media(store, result, "replace_audio", start, end, source, offset,
+                          progress=lambda p: progress(.7 + p * .3))
     is_video = operation in {"replace_video", "brighten", "darken", "fill"}
     first, last = interval(manifest, start, end, is_video)
     if operation == "replace_video":
@@ -199,7 +209,8 @@ def edit_media(store: Store, manifest: dict, operation: str, start, end, source:
             factor = 1.2 if operation == "brighten" else .8
             table = bytes(min(255, round(v * factor)) for v in range(256))
             for i in range(first, last):
-                result["video"][i] = store.put("video", store.get("video", manifest["video"][i]).translate(table))
+                base = manifest["video"][i]
+                result["video"][i] = store.put_video_lut(base, table, store.get("video", base).translate(table))
                 progress((i - first + 1) / (last - first))
     elif operation == "replace_audio":
         if source is None:

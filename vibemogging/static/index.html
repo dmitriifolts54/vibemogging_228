@@ -10,6 +10,7 @@
 <body>
   <header class="topbar">
     <div class="brand">
+      <button type="button" class="back-btn" id="backToProjectsBtn" data-mutate hidden title="Закрыть проект и вернуться к списку">← Проекты</button>
       <span class="logo" aria-hidden="true">▶</span>
       <span class="brand-name">Vibemogging</span>
       <span class="project-name" id="projectName"></span>
@@ -44,10 +45,59 @@
     Нет связи с локальным сервером. Убедитесь, что запущено <code>python3 -m vibemogging</code>.
   </div>
 
+  <!-- Project list (workspace mode) -->
+  <main class="projects" id="projectsView" hidden>
+    <div class="projects-head">
+      <div>
+        <h1>Проекты</h1>
+        <p class="muted small" id="workspaceRoot"></p>
+      </div>
+    </div>
+    <div class="projects-layout">
+      <section class="project-list-panel">
+        <ul class="project-list" id="projectList"></ul>
+        <p class="muted" id="projectListEmpty" hidden>Проектов пока нет. Создайте первый справа.</p>
+      </section>
+      <section class="project-forms">
+        <form class="card" id="createProjectForm">
+          <h2>Новый проект</h2>
+          <label class="stack-field">
+            <span>Название</span>
+            <input type="text" id="newProjectName" maxlength="120" placeholder="Например, Отпуск 2026" required data-mutate>
+          </label>
+          <button type="submit" class="primary" data-mutate>Создать</button>
+        </form>
+        <details class="card" id="cloudCloneCard">
+          <summary><h2>Получить общий проект из облака</h2></summary>
+          <p class="muted small">Папка облачного клиента (Dropbox, Яндекс Диск, iCloud Drive…), куда другой компьютер уже опубликовал проект.</p>
+          <form id="cloudFolderForm" class="inline-form">
+            <input type="text" id="cloneFolder" placeholder="/Users/имя/Dropbox/Vibemogging" spellcheck="false" data-mutate>
+            <button type="submit" data-mutate>Найти</button>
+          </form>
+          <form id="cloneForm" hidden>
+            <label class="stack-field"><span>Проект и устройство-источник</span><select id="cloneSource" data-mutate></select></label>
+            <label class="stack-field"><span>Имя этого компьютера</span>
+              <input type="text" id="cloneDevice" placeholder="macbook" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,39}" spellcheck="false" required data-mutate></label>
+            <label class="stack-field"><span>Название у вас</span><input type="text" id="cloneName" maxlength="120" data-mutate></label>
+            <button type="submit" class="primary" data-mutate>Получить</button>
+          </form>
+        </details>
+        <details class="card">
+          <summary><h2>Добавить существующую папку</h2></summary>
+          <p class="muted small">Например, старый проект V1 (<code>.vibemogging</code>). Папка не перемещается и не меняется.</p>
+          <form id="registerForm" class="inline-form">
+            <input type="text" id="registerPath" placeholder="/Users/имя/vibemogging_228/.vibemogging" spellcheck="false" data-mutate>
+            <button type="submit" data-mutate>Добавить</button>
+          </form>
+        </details>
+      </section>
+    </div>
+  </main>
+
   <!-- Empty repository -->
   <main class="empty" id="emptyView" hidden>
-    <h1>Новый проект</h1>
-    <p class="muted">Все данные хранятся локально в папке данных приложения.</p>
+    <h1 id="emptyTitle">Новый проект</h1>
+    <p class="muted">Все данные хранятся локально в папке проекта. Исходный файл сохраняется один раз, без перекодирования.</p>
     <div class="empty-cards">
       <section class="card">
         <h2>Импорт видео</h2>
@@ -156,15 +206,19 @@
             <label><input type="radio" name="op" value="mute"> Отключить звук</label>
             <label><input type="radio" name="op" value="gain"> Громкость</label>
           </fieldset>
+          <fieldset>
+            <legend>Обе дорожки</legend>
+            <label><input type="radio" name="op" value="replace_av"> Заменить видео и звук</label>
+          </fieldset>
         </div>
         <div class="op-params">
-          <div class="param" data-for="replace_video replace_audio">
+          <div class="param" data-for="replace_video replace_audio replace_av">
             <label class="file-field">
               <span id="replaceLabel">Файл-источник (видео)</span>
               <input type="file" id="replaceFile" accept="video/*,audio/*">
             </label>
           </div>
-          <div class="param" data-for="replace_video replace_audio">
+          <div class="param" data-for="replace_video replace_audio replace_av">
             <label class="inline-field">
               <span>Смещение в источнике, с</span>
               <input type="number" id="replaceOffset" min="0" step="0.01" value="0">
@@ -197,6 +251,7 @@
         <button type="button" role="tab" class="tab" data-tab="branches">Ветки</button>
         <button type="button" role="tab" class="tab" data-tab="compare">Сравнение</button>
         <button type="button" role="tab" class="tab" data-tab="merge">Слияние <span class="badge" id="mergeBadge" hidden></span></button>
+        <button type="button" role="tab" class="tab" data-tab="cloud">Облако</button>
       </nav>
 
       <!-- Versions -->
@@ -223,6 +278,8 @@
         </form>
         <h3>История</h3>
         <ol class="history" id="historyList"></ol>
+        <h3>Хранение</h3>
+        <dl class="storage" id="storageInfo"></dl>
       </section>
 
       <!-- Branches -->
@@ -300,6 +357,32 @@
           </form>
         </div>
       </section>
+
+      <!-- Cloud folder -->
+      <section class="tab-body" data-body="cloud" hidden>
+        <div id="cloudOff">
+          <p class="muted">Общая папка уже установленного облачного клиента (Dropbox, Яндекс Диск, iCloud Drive, Google Drive…). Каждое устройство публикует свои версии; передаются только недостающие файлы. Слияние — как обычно, вручную.</p>
+          <form id="cloudConnectForm">
+            <label class="stack-field"><span>Папка в облачном клиенте (полный путь)</span>
+              <input type="text" id="cloudFolder" placeholder="/Users/имя/Dropbox/Vibemogging" spellcheck="false" data-mutate></label>
+            <label class="stack-field"><span>Имя этого компьютера</span>
+              <input type="text" id="cloudDevice" placeholder="macbook" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,39}" spellcheck="false" data-mutate></label>
+            <button type="submit" class="primary" data-mutate>Подключить</button>
+          </form>
+        </div>
+        <div id="cloudOn" hidden>
+          <dl class="storage" id="cloudInfo"></dl>
+          <div class="commit-row">
+            <button type="button" id="cloudRefreshBtn">Обновить</button>
+            <button type="button" class="primary" id="cloudPublishBtn" data-mutate>Опубликовать версии</button>
+          </div>
+          <p class="hint">Публикуются сохранённые коммиты локальных веток. Несохранённый черновик остаётся на этом компьютере.</p>
+          <h3>Другие устройства</h3>
+          <ul class="branch-list" id="cloudDevices"></ul>
+          <p class="hint">Облачная папка не является блокировкой: договоритесь, кто сливает изменения, и обменивайтесь результатом.</p>
+          <button type="button" class="danger-ghost" id="cloudDisconnectBtn" data-mutate>Отключить папку</button>
+        </div>
+      </section>
     </aside>
   </main>
 
@@ -319,6 +402,23 @@
       <div class="dialog-actions">
         <button type="button" id="peerCancel">Отмена</button>
         <button type="submit" class="primary" value="ok">Импортировать</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="migrateDialog">
+    <form method="dialog" class="dialog-body" id="migrateForm">
+      <h2>Компактная копия проекта</h2>
+      <p>Будет создан <strong>новый</strong> проект с той же историей, ветками, черновиками и конфликтами. Исходная папка не изменяется и не удаляется.</p>
+      <p class="muted small">Старые кадры упаковываются в lossless-видео (<code>libx264rgb -crf 0</code>) короткими клипами; каждый кадр сверяется по ID. Кадры, которые не совпали бит в бит, остаются как есть. Насколько уменьшится размер, зависит от материала — итог покажем после проверки.</p>
+      <label class="stack-field">
+        <span>Исходный видеофайл первой версии (необязательно, полный путь)</span>
+        <input type="text" id="migrateSource" placeholder="/Users/имя/Movies/clip.mov" spellcheck="false">
+      </label>
+      <p class="muted small" id="migrateName"></p>
+      <div class="dialog-actions">
+        <button type="button" id="migrateCancel">Отмена</button>
+        <button type="submit" class="primary" value="ok">Создать копию</button>
       </div>
     </form>
   </dialog>

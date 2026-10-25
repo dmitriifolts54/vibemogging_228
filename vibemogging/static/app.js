@@ -29,6 +29,7 @@ const OPERATIONS = {
   replace_audio: { label: "Заменить звук", track: "audio", upload: true },
   mute: { label: "Отключить звук", track: "audio" },
   gain: { label: "Громкость", track: "audio" },
+  replace_av: { label: "Заменить видео и звук", track: "both", upload: true },
 };
 const CHOICES = { base: "Исходная", ours: "Наша", theirs: "Входящая" };
 const BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,79}$/;
@@ -47,6 +48,9 @@ const state = {
   compare: null,        // { left, right, diff }
   waveKey: null,
   wavePeaks: null,
+  projects: null,       // last /api/projects listing
+  cloud: null,          // last /api/cloud status
+  cloneCandidates: [],
 };
 
 /* ---------- formatting ---------- */
@@ -180,6 +184,8 @@ async function runActions(payloads, { labels = [], file = null, quiet = false } 
   } finally {
     hideJob();
     setBusy(false);
+    state.cloudStale = true;
+    state.projectsFor = null;
     await refreshStatus();
   }
   return results;
@@ -258,7 +264,21 @@ function confirmAction(title, text, okLabel = "Подтвердить") {
     $("confirmText").textContent = text;
     $("confirmOk").textContent = okLabel;
     confirmDialog.returnValue = "";
-    confirmDialog.addEventListener("close", () => resolve(confirmDialog.returnValue === "ok"), { once: true });
+    // The form's submit event fires synchronously on the button press; "close"
+    // (Esc) is only a fallback, as some browsers delay it for background tabs.
+    const form = confirmDialog.querySelector("form");
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      form.removeEventListener("submit", onSubmit);
+      confirmDialog.removeEventListener("close", onClose);
+      resolve(value);
+    };
+    const onSubmit = (event) => finish(Boolean(event.submitter && event.submitter.value === "ok"));
+    const onClose = () => finish(confirmDialog.returnValue === "ok");
+    form.addEventListener("submit", onSubmit);
+    confirmDialog.addEventListener("close", onClose);
     confirmDialog.showModal();
   });
 }
@@ -299,16 +319,24 @@ const localBranches = () => Object.keys(s().branches || {}).filter((name) => !(s
 
 /* ---------- rendering ---------- */
 
+const chooser = () => s().mode === "workspace" && !s().open;
+const projectTitle = () => (s().workspace_project && s().workspace_project.name) || (s().project && s().project.name) || "";
+
 function render() {
   $("loadingView").hidden = true;
   $("ffmpegBanner").hidden = s().ffmpeg !== false;
   const loaded = project();
-  $("emptyView").hidden = loaded;
+  const listing = chooser();
+  $("projectsView").hidden = !listing;
+  $("emptyView").hidden = loaded || listing;
   $("workspace").hidden = !loaded;
   $("topbarState").hidden = !loaded;
   $("topbarActions").hidden = !loaded;
-  $("projectName").textContent = loaded ? s().project.name : "";
-  document.title = loaded ? `${s().project.name} — Vibemogging` : "Vibemogging";
+  $("backToProjectsBtn").hidden = !(s().mode === "workspace" && s().open);
+  $("projectName").textContent = listing ? "" : projectTitle();
+  $("emptyTitle").textContent = s().workspace_project ? `Проект «${s().workspace_project.name}»` : "Новый проект";
+  document.title = listing ? "Проекты — Vibemogging" : (projectTitle() ? `${projectTitle()} — Vibemogging` : "Vibemogging");
+  if (listing) loadProjects();
   if (loaded) {
     if (state.selection && state.selection.end > duration()) state.selection = null;
     renderTopbar();
@@ -318,6 +346,8 @@ function render() {
     renderBranches();
     renderCompareRefs();
     renderMerge();
+    renderStorage();
+    renderCloudBasics();
     loadWaveform();
   }
   updateControls();
@@ -339,6 +369,7 @@ function updateControls() {
   const merge = mergePending();
   const st = s();
   document.querySelectorAll("[data-mutate]").forEach((node) => { node.disabled = busy; });
+  document.querySelectorAll("[data-project-action]").forEach((node) => { node.disabled = busy; });
   if (!project()) {
     $("importVideoBtn").disabled = busy || !$("importVideoFile").files.length || st.ffmpeg === false;
     $("openRepoBtn").disabled = busy || !$("openRepoFile").files.length;
@@ -414,12 +445,17 @@ function loadFrameImage() {
     const ref = playerRefParam();
     const version = ref === "working" ? `&v=${s().manifest}` : "";
     const src = `/api/frame?ref=${encodeURIComponent(ref)}&frame=${frameAt(state.time)}${version}`;
-    if (frameImage.getAttribute("src") !== src) frameImage.src = src;
+    if (frameImage.getAttribute("src") !== src) {
+      frameImage.classList.add("loading");  // a source frame may need decoding first
+      frameImage.src = src;
+    }
     frameImage.alt = `Кадр ${frameAt(state.time)}`;
   }, 60);
 }
 
+frameImage.addEventListener("load", () => frameImage.classList.remove("loading"));
 frameImage.addEventListener("error", () => {
+  frameImage.classList.remove("loading");
   if (frameImage.getAttribute("src")) toast("Не удалось получить кадр.", "error");
 });
 
@@ -708,7 +744,10 @@ function renderOperationParams() {
   document.querySelectorAll(".param").forEach((node) => {
     node.hidden = !node.dataset.for.split(" ").includes(op);
   });
-  $("replaceLabel").textContent = op === "replace_audio" ? "Файл-источник (аудио или видео)" : "Файл-источник (видео)";
+  $("replaceLabel").textContent = {
+    replace_audio: "Файл-источник (аудио или видео)",
+    replace_av: "Видеофайл со звуком: обе дорожки заменятся вместе",
+  }[op] || "Файл-источник (видео)";
   $("replaceFile").accept = op === "replace_audio" ? "audio/*,video/*" : "video/*";
 }
 
@@ -755,6 +794,16 @@ function readRangeInputs() {
   }
   setSelection(start, end);
   return state.selection;
+}
+
+function formatRangeOnBlur() {
+  const start = parseTime($("rangeStart").value);
+  const end = parseTime($("rangeEnd").value);
+  // Preserve a partially entered range until both fields are valid. Clearing
+  // the first field on blur makes it impossible to enter the second one.
+  if (Number.isFinite(start) && Number.isFinite(end) && end > start && end <= duration() + 1e-6) {
+    renderSelection();
+  }
 }
 
 function onRangeInput() {
@@ -1147,8 +1196,8 @@ async function startMerge() {
     toast("Сначала сохраните или сбросьте черновик текущей ветки.", "error");
     return;
   }
+  $("mergeMessage").value = "";  // renderMerge fills the default text for the new merge
   await runAction({ action: "merge", source }, { label: `Слияние ${source} → ${s().branch}…` });
-  $("mergeMessage").value = "";
 }
 
 async function finishMerge(event) {
@@ -1209,6 +1258,226 @@ $("peerCancel").addEventListener("click", () => {
   peerDialog.close();
 });
 
+/* ---------- projects (workspace mode) ---------- */
+
+function fmtBytes(value) {
+  if (!Number.isFinite(value)) return "—";
+  const units = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return `${unit ? value.toFixed(value < 10 ? 2 : 1) : value} ${units[unit]}`;
+}
+
+let projectsRequest = null;
+async function loadProjects() {
+  if (projectsRequest || state.projectsFor === state.status) return;
+  state.projectsFor = state.status;
+  projectsRequest = api("/api/projects").then((data) => {
+    state.projects = data;
+    renderProjects();
+  }).catch((error) => toast(error.message, "error")).finally(() => { projectsRequest = null; });
+}
+
+function renderProjects() {
+  const data = state.projects;
+  if (!data) return;
+  $("workspaceRoot").textContent = `Папка списка: ${data.root}`;
+  $("projectListEmpty").hidden = data.projects.length > 0;
+  $("projectList").replaceChildren(...data.projects.map((item) => {
+    const size = item.storage && (item.storage.total_bytes ?? item.storage.folder_bytes);
+    const meta = [
+      item.available ? (item.initialised ? `видео: ${item.video_name}` : "пустой — нужно импортировать видео") : "папка не найдена",
+      size !== undefined && size !== null ? `размер: ${fmtBytes(size)}` : null,
+      item.legacy ? "старое хранение кадров — можно сделать компактную копию" : null,
+      item.cloud ? "общая папка подключена" : null,
+      item.opened ? `открыт ${fmtDate(item.opened)}` : `создан ${fmtDate(item.created)}`,
+    ].filter(Boolean);
+    return el("li", { class: `project-item ${item.available ? "" : "missing"}` },
+      el("div", { class: "project-title" }, item.name),
+      el("div", { class: "project-actions" },
+        el("button", { type: "button", class: "primary", "data-project-action": true, disabled: !item.available,
+          onclick: () => runAction({ action: "project_open", id: item.id }, { label: `Открытие «${item.name}»…` }) }, "Открыть"),
+        item.initialised ? el("button", { type: "button", "data-project-action": true,
+          title: "Новая папка с той же историей и компактным хранением кадров",
+          onclick: () => askMigrate(item) }, "Компактная копия") : null,
+        el("button", { type: "button", class: "danger-ghost", "data-project-action": true, onclick: () => forgetProject(item) },
+          "Убрать")),
+      el("div", { class: "project-meta" }, meta.map((text) => el("span", {}, text))),
+      el("div", { class: "project-meta muted small", title: item.path }, item.path));
+  }));
+  updateControls();
+}
+
+async function forgetProject(item) {
+  const ok = await confirmAction("Убрать проект из списка?",
+    `«${item.name}» исчезнет из списка. Папка ${item.path} и все данные в ней останутся на диске.`, "Убрать из списка");
+  if (ok) await runAction({ action: "project_forget", id: item.id }, { label: "Обновление списка…" });
+}
+
+let migrateTarget = null;
+function askMigrate(item) {
+  migrateTarget = item;
+  $("migrateName").textContent = `Исходный проект: ${item.name} (${item.path})`;
+  $("migrateSource").value = "";
+  $("migrateDialog").showModal();
+}
+$("migrateForm").addEventListener("submit", () => {
+  const item = migrateTarget;
+  migrateTarget = null;
+  if (!item) return;
+  const payload = { action: "project_migrate", id: item.id };
+  const original = $("migrateSource").value.trim();
+  if (original) payload.source_media = original;
+  setTimeout(async () => {
+    const result = await runAction(payload, { label: `Компактная копия «${item.name}»…` });
+    if (result && result.report) {
+      const r = result.report;
+      toast(`Кадров: ${r.frames}. Из исходного файла: ${r.from_original}, как эффект яркости: ${r.recovered_luts || 0}, ` +
+        `упаковано lossless: ${r.packed}, перенесено рецептов: ${r.kept_recipes}, оставлено как есть: ${r.fallback}. ` +
+        `Проверено бит в бит: ${r.verified_frames}.` +
+        (r.original_matched === false ? " Исходный файл не совпал с первой версией и не использован." : ""), "info");
+    }
+  }, 0);
+});
+$("migrateCancel").addEventListener("click", () => { migrateTarget = null; $("migrateDialog").close(); });
+
+async function findCloudProjects(event) {
+  event.preventDefault();
+  const folder = $("cloneFolder").value.trim();
+  if (!folder) return;
+  try {
+    const data = await api(`/api/cloud/projects?folder=${encodeURIComponent(folder)}`);
+    state.cloneCandidates = data.projects.flatMap((p) => p.devices.map((device) => ({ ...p, device })));
+    if (!state.cloneCandidates.length) {
+      toast("В этой папке нет опубликованных проектов Vibemogging (или они ещё синхронизируются).", "error");
+      $("cloneForm").hidden = true;
+      return;
+    }
+    $("cloneSource").replaceChildren(...state.cloneCandidates.map((c, i) =>
+      el("option", { value: String(i) }, `${c.name} — устройство ${c.device}`)));
+    $("cloneName").value = state.cloneCandidates[0].name || "";
+    $("cloneForm").hidden = false;
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+function cloneFromCloud(event) {
+  event.preventDefault();
+  const candidate = state.cloneCandidates[Number($("cloneSource").value)];
+  const device = $("cloneDevice").value.trim();
+  if (!candidate) return;
+  if (!PEER_RE.test(device)) {
+    toast("Имя этого компьютера: латинские буквы, цифры, «.», «_», «-».", "error");
+    return;
+  }
+  if (device === candidate.device) {
+    toast("Имя этого компьютера должно отличаться от устройства-источника.", "error");
+    return;
+  }
+  runAction({ action: "project_clone_cloud", folder: $("cloneFolder").value.trim(), project: candidate.id,
+    source_device: candidate.device, device, name: $("cloneName").value.trim() || candidate.name },
+  { label: "Получение общего проекта…" });
+}
+
+/* ---------- storage and cloud panel ---------- */
+
+function storageRows(target, rows) {
+  target.replaceChildren(...rows.filter(([, value]) => value !== null && value !== undefined)
+    .flatMap(([label, value]) => [el("dt", {}, label), el("dd", {}, value)]));
+}
+
+function renderStorage() {
+  const st = s().storage || {};
+  const cache = s().preview_cache || {};
+  storageRows($("storageInfo"), [
+    ["Папка проекта", st.folder_bytes !== undefined ? fmtBytes(st.folder_bytes) : null],
+    ["Исходники", st.asset_bytes !== undefined ? `${fmtBytes(st.asset_bytes)} (${st.assets})` : null],
+    ["Объекты", st.object_bytes !== undefined ? `${fmtBytes(st.object_bytes)} (${st.objects})` : null],
+    ["Рецепты кадров", st.recipes !== undefined ? `${st.recipes} · индекс ${fmtBytes(st.index_bytes)}` : null],
+    ["Предпросмотры", cache.preview_limit ? `${fmtBytes(cache.preview_bytes)} из ${fmtBytes(cache.preview_limit)} (${cache.preview_files})` : null],
+    ["Расположение", s().data_dir],
+  ]);
+}
+
+function renderCloudBasics() {
+  const cloud = s().cloud || {};
+  $("cloudOff").hidden = Boolean(cloud.connected);
+  $("cloudOn").hidden = !cloud.connected;
+  if (cloud.error) toast(cloud.error, "error");
+  if (cloud.connected && document.querySelector('.tab[data-tab="cloud"]').classList.contains("active") && state.cloudStale !== false) {
+    loadCloud();
+  }
+  if (!cloud.connected) state.cloud = null;
+  renderCloud();
+}
+
+let cloudRequest = null;
+async function loadCloud() {
+  if (cloudRequest || serverBusy()) return;
+  state.cloudStale = false;
+  cloudRequest = api("/api/cloud").then((data) => {
+    state.cloud = data;
+    renderCloud();
+  }).catch((error) => toast(error.message, "error")).finally(() => { cloudRequest = null; });
+}
+
+function renderCloud() {
+  const data = state.cloud;
+  const basics = s().cloud || {};
+  storageRows($("cloudInfo"), [
+    ["Это устройство", basics.device],
+    ["Папка", basics.folder],
+    ["Последняя публикация", data ? (data.published_at
+      ? `${fmtDate(data.published_at)} · ${Object.keys(data.published_branches || {}).join(", ")}` : "ещё не было") : "…"],
+  ]);
+  const devices = data ? data.devices : [];
+  $("cloudDevices").replaceChildren(...(devices.length ? devices.map((device) => {
+    const latest = device.latest;
+    let status, kind = "";
+    if (!latest) {
+      status = device.unreadable ? "Снимок ещё синхронизируется." : "Ещё ничего не опубликовано.";
+      kind = "warn";
+    } else if (!latest.complete) {
+      status = `Облако ещё синхронизирует: не хватает файлов — ${latest.missing_files} (${fmtBytes(latest.missing_bytes)}). Проект не изменится, пока всё не придёт.`;
+      kind = "warn";
+    } else if (latest.received) {
+      status = `Получено: ${fmtDate(latest.created)}. Ветки: ${Object.keys(latest.branches).map((b) => `${device.device}/${b}`).join(", ")}.`;
+      kind = "ok";
+    } else {
+      status = `Новый снимок от ${fmtDate(latest.created)}: ветки ${Object.keys(latest.branches).join(", ")}.`;
+    }
+    return el("li", {},
+      el("span", { class: "name grow" }, device.device),
+      el("button", { type: "button", "data-needs-switch": latest && latest.complete ? true : undefined,
+        disabled: !(latest && latest.complete), title: latest && latest.complete ? "" : "Дождитесь окончания синхронизации",
+        onclick: () => receiveFrom(device.device) }, latest && latest.received ? "Получить снова" : "Получить"),
+      el("span", { class: `device-status ${kind}` }, status));
+  }) : [el("li", { class: "empty-note" }, data ? "Других устройств пока нет. На втором компьютере выберите «Получить общий проект из облака»." : "Загрузка…")]));
+  updateControls();
+}
+
+async function receiveFrom(device) {
+  const result = await runAction({ action: "cloud_receive", device }, { label: `Получение версий ${device}…` });
+  if (result && result.branches && result.branches.length) prepareMerge(result.head || result.branches[0]);
+}
+
+function connectCloud(event) {
+  event.preventDefault();
+  const device = $("cloudDevice").value.trim();
+  if (!PEER_RE.test(device)) {
+    toast("Имя этого компьютера: латинские буквы, цифры, «.», «_», «-»; до 40 символов.", "error");
+    return;
+  }
+  runAction({ action: "cloud_connect", folder: $("cloudFolder").value.trim(), device }, { label: "Подключение общей папки…" });
+}
+
+async function disconnectCloud() {
+  const ok = await confirmAction("Отключить общую папку?",
+    "Этот проект перестанет публиковать и получать версии. Файлы в общей папке и полученные ветки останутся.", "Отключить");
+  if (ok) await runAction({ action: "cloud_disconnect" }, { label: "Отключение…" });
+}
+
 /* ---------- tabs ---------- */
 
 function selectTab(name) {
@@ -1219,6 +1488,7 @@ function selectTab(name) {
   });
   document.querySelectorAll(".tab-body").forEach((body) => { body.hidden = body.dataset.body !== name; });
   try { localStorage.setItem("vm-tab", name); } catch { /* storage unavailable */ }
+  if (name === "cloud" && s().cloud && s().cloud.connected) loadCloud();
 }
 
 /* ---------- wiring ---------- */
@@ -1268,8 +1538,8 @@ $("frameInput").addEventListener("keydown", (event) => {
 
 $("rangeStart").addEventListener("input", onRangeInput);
 $("rangeEnd").addEventListener("input", onRangeInput);
-$("rangeStart").addEventListener("blur", renderSelection);
-$("rangeEnd").addEventListener("blur", renderSelection);
+$("rangeStart").addEventListener("blur", formatRangeOnBlur);
+$("rangeEnd").addEventListener("blur", formatRangeOnBlur);
 $("startFromPlayhead").addEventListener("click", () => {
   const start = snap(frameAt(state.time) / fps());
   const end = state.selection && state.selection.end > start ? state.selection.end : Math.min(duration(), start + 1);
@@ -1295,6 +1565,30 @@ $("mergeSource").addEventListener("change", updateControls);
 $("mergeBtn").addEventListener("click", startMerge);
 $("mergeCommitForm").addEventListener("submit", finishMerge);
 $("cancelMergeBtn").addEventListener("click", cancelMerge);
+
+$("backToProjectsBtn").addEventListener("click", () => {
+  video.pause();
+  backToWorking();
+  runAction({ action: "project_close" }, { label: "Закрытие проекта…" });
+});
+$("createProjectForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const name = $("newProjectName").value.trim();
+  if (!name) return;
+  runAction({ action: "project_create", name }, { label: `Создание проекта «${name}»…` })
+    .then((result) => { if (result) $("newProjectName").value = ""; });
+});
+$("registerForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const path = $("registerPath").value.trim();
+  if (path) runAction({ action: "project_register", path }, { label: "Добавление папки…" });
+});
+$("cloudFolderForm").addEventListener("submit", findCloudProjects);
+$("cloneForm").addEventListener("submit", cloneFromCloud);
+$("cloudConnectForm").addEventListener("submit", connectCloud);
+$("cloudRefreshBtn").addEventListener("click", loadCloud);
+$("cloudPublishBtn").addEventListener("click", () => runAction({ action: "cloud_publish" }, { label: "Публикация версий в общую папку…" }));
+$("cloudDisconnectBtn").addEventListener("click", disconnectCloud);
 
 document.addEventListener("keydown", (event) => {
   if (!project() || event.target.closest("input, textarea, select, dialog, button") || event.metaKey || event.ctrlKey || event.altKey) return;
