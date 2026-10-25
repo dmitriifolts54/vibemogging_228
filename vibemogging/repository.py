@@ -28,7 +28,8 @@ class Repository:
             self.state = json.loads(state_file.read_text())
         else:
             self.state = {"format": 1, "project": None, "head": "main", "branches": {},
-                          "drafts": {}, "merge": None}
+                          "drafts": {}, "merge": None, "incoming": []}
+        self.state.setdefault("incoming", [])
 
     def save(self):
         atomic_write(self.root / "state.json", canonical(self.state))
@@ -240,6 +241,7 @@ class Repository:
                 conflict["start_time"], conflict["end_time"] = conflict["start"] / scale, conflict["end"] / scale
         return {"project": self.state["project"], "branch": self.state["head"],
                 "branches": self.state["branches"], "drafts": list(self.state["drafts"]),
+                "incoming": self.state["incoming"],
                 "head": self.head, "dirty": self.dirty(), "merge": pending,
                 "manifest": self.manifest_id(), "width": manifest["width"], "height": manifest["height"],
                 "fps": fps, "frames": len(manifest["video"]), "duration": len(manifest["video"]) / fps,
@@ -249,8 +251,16 @@ class Repository:
         self.assert_clean()
         if not self.head:
             raise UserError("Сначала создайте проект.")
+        branches = {name: ref for name, ref in self.state["branches"].items()
+                    if name not in self.state["incoming"]}
+        if not branches:
+            raise UserError("Создайте локальную ветку перед передачей репозитория.")
+        reachable = set()
+        for ref in branches.values():
+            reachable.update(self.ancestors(ref))
         objects = set()
-        for commit in self.history():
+        for commit_id in reachable:
+            commit = {**self.get_commit(commit_id), "id": commit_id}
             objects.add(("commit", commit["id"]))
             objects.add(("manifest", commit["manifest"]))
             manifest = self.store.get_json("manifest", commit["manifest"])
@@ -261,8 +271,8 @@ class Repository:
         try:
             with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=3) as archive:
                 archive.writestr("index.json", canonical({"format": 1, "project": self.state["project"],
-                                                          "branches": self.state["branches"],
-                                                          "head": self.state["head"]}))
+                                                          "branches": branches,
+                                                          "head": self.state["head"] if self.state["head"] in branches else next(iter(branches))}))
                 for kind, object_id in sorted(objects):
                     archive.writestr(f"objects/{kind}/{object_id}", self.store.get(kind, object_id))
             temporary.replace(output)
@@ -296,6 +306,11 @@ class Repository:
                     raise UserError("Повреждена ссылка на версию.")
             if self.state["project"] and self.state["head"] in {f"{peer}/{name}" for name in branches}:
                 raise UserError("Переключитесь с входящей ветки перед её обновлением.")
+            if self.state["project"]:
+                for name in branches:
+                    target = self.branch_name(f"{peer}/{name}")
+                    if target in self.state["branches"] and target not in self.state["incoming"]:
+                        raise UserError("Входящая ветка совпадает с локальной. Выберите другое имя участника.")
             known = set()
             for item in archive.infolist():
                 if item.filename == "index.json":
@@ -320,7 +335,10 @@ class Repository:
             self.state["head"] = index.get("head") if index.get("head") in branches else next(iter(branches))
         else:
             for name, ref in branches.items():
-                self.state["branches"][self.branch_name(f"{peer}/{name}")] = ref
+                target = self.branch_name(f"{peer}/{name}")
+                self.state["branches"][target] = ref
+                if target not in self.state["incoming"]:
+                    self.state["incoming"].append(target)
         self.save()
 
     def _validate_bundle(self, branches, known):
@@ -333,8 +351,12 @@ class Repository:
             if ("commit", ref) not in known:
                 raise UserError("В файле не хватает коммитов.")
             commit = self.store.get_json("commit", ref)
+            if not isinstance(commit, dict):
+                raise UserError("Повреждено описание коммита.")
             manifest_id = commit.get("manifest")
-            if ("manifest", manifest_id) not in known or not isinstance(commit.get("parents"), list):
+            if (not valid_id(manifest_id) or ("manifest", manifest_id) not in known or
+                not isinstance(commit.get("parents"), list) or
+                not all(valid_id(parent) for parent in commit["parents"])):
                 raise UserError("Повреждено описание версии.")
             for key in ("created", "message", "author"):
                 if not isinstance(commit.get(key), str):

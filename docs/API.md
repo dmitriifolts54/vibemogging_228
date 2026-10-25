@@ -54,6 +54,10 @@ Loaded repository (illustrative):
 to render it. `drafts` identifies branches with saved working drafts; these
 drafts survive switching branches and restarting the application.
 
+An additional `incoming` string array lists imported tracking branches (such as
+`bob/main`). Bundles export local branches and their reachable committed history;
+tracking branches are not re-exported as nested `bob/alice/bob/...` names.
+
 When a merge is pending, `merge` has the form:
 
 ```json
@@ -122,6 +126,10 @@ upload progress where practical. Do not imply failed jobs succeeded.
 | `export` | optional `ref` | Render MP4; result has `download_url` |
 | `bundle_export` | none | Download portable committed repository (`.vmrepo`); requires clean current branch |
 | `bundle_import` | `upload`, optional `peer` (default `peer`) | Clone into empty repo, otherwise add/update `peer/BRANCH` refs |
+
+Importing cannot overwrite an owned local branch with the same incoming name;
+choose another `peer` prefix in that case. Updates of a currently checked-out
+incoming branch are rejected until the user switches away from it.
 
 Edit operations:
 

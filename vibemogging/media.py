@@ -97,6 +97,7 @@ def decode_audio(path: Path, target: Path, duration: float, offset=0, required=F
         target.write_bytes(b"")
         return
     process = subprocess.run(command("-ss", offset, "-i", path, "-map", "0:a:0", "-vn",
+                                      "-af", "aresample=48000:async=1:first_pts=0",
                                       "-t", f"{duration:.12f}", "-ar", SAMPLE_RATE,
                                       "-ac", CHANNELS, "-acodec", "pcm_s16le", "-f", "s16le", target),
                              capture_output=True)
