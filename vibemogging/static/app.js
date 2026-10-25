@@ -264,7 +264,21 @@ function confirmAction(title, text, okLabel = "Подтвердить") {
     $("confirmText").textContent = text;
     $("confirmOk").textContent = okLabel;
     confirmDialog.returnValue = "";
-    confirmDialog.addEventListener("close", () => resolve(confirmDialog.returnValue === "ok"), { once: true });
+    // The form's submit event fires synchronously on the button press; "close"
+    // (Esc) is only a fallback, as some browsers delay it for background tabs.
+    const form = confirmDialog.querySelector("form");
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      form.removeEventListener("submit", onSubmit);
+      confirmDialog.removeEventListener("close", onClose);
+      resolve(value);
+    };
+    const onSubmit = (event) => finish(Boolean(event.submitter && event.submitter.value === "ok"));
+    const onClose = () => finish(confirmDialog.returnValue === "ok");
+    form.addEventListener("submit", onSubmit);
+    confirmDialog.addEventListener("close", onClose);
     confirmDialog.showModal();
   });
 }
@@ -431,12 +445,17 @@ function loadFrameImage() {
     const ref = playerRefParam();
     const version = ref === "working" ? `&v=${s().manifest}` : "";
     const src = `/api/frame?ref=${encodeURIComponent(ref)}&frame=${frameAt(state.time)}${version}`;
-    if (frameImage.getAttribute("src") !== src) frameImage.src = src;
+    if (frameImage.getAttribute("src") !== src) {
+      frameImage.classList.add("loading");  // a source frame may need decoding first
+      frameImage.src = src;
+    }
     frameImage.alt = `Кадр ${frameAt(state.time)}`;
   }, 60);
 }
 
+frameImage.addEventListener("load", () => frameImage.classList.remove("loading"));
 frameImage.addEventListener("error", () => {
+  frameImage.classList.remove("loading");
   if (frameImage.getAttribute("src")) toast("Не удалось получить кадр.", "error");
 });
 
@@ -1430,7 +1449,7 @@ function renderCloud() {
 
 async function receiveFrom(device) {
   const result = await runAction({ action: "cloud_receive", device }, { label: `Получение версий ${device}…` });
-  if (result && result.branches && result.branches.length) prepareMerge(result.branches[0]);
+  if (result && result.branches && result.branches.length) prepareMerge(result.head || result.branches[0]);
 }
 
 function connectCloud(event) {
