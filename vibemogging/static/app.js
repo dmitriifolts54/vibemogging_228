@@ -1259,7 +1259,7 @@ function renderProjects() {
     const meta = [
       item.available ? (item.initialised ? `видео: ${item.video_name}` : "пустой — нужно импортировать видео") : "папка не найдена",
       size !== undefined && size !== null ? `размер: ${fmtBytes(size)}` : null,
-      item.storage && item.storage.recipes === 0 && item.storage.object_bytes > 0 ? "старое хранение кадров" : null,
+      item.legacy ? "старое хранение кадров — можно сделать компактную копию" : null,
       item.cloud ? "общая папка подключена" : null,
       item.opened ? `открыт ${fmtDate(item.opened)}` : `создан ${fmtDate(item.created)}`,
     ].filter(Boolean);
@@ -1303,8 +1303,10 @@ $("migrateForm").addEventListener("submit", () => {
     const result = await runAction(payload, { label: `Компактная копия «${item.name}»…` });
     if (result && result.report) {
       const r = result.report;
-      toast(`Кадров: ${r.frames}; упаковано: ${r.packed}, рецептов сохранено: ${r.kept_recipes}, ` +
-        `без упаковки: ${r.fallback}. Проверено кадров: ${r.verified_frames}.`, "info");
+      toast(`Кадров: ${r.frames}. Из исходного файла: ${r.from_original}, как эффект яркости: ${r.recovered_luts || 0}, ` +
+        `упаковано lossless: ${r.packed}, перенесено рецептов: ${r.kept_recipes}, оставлено как есть: ${r.fallback}. ` +
+        `Проверено бит в бит: ${r.verified_frames}.` +
+        (r.original_matched === false ? " Исходный файл не совпал с первой версией и не использован." : ""), "info");
     }
   }, 0);
 });

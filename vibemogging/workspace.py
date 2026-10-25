@@ -110,7 +110,7 @@ class Workspace:
             except (OSError, ValueError, AttributeError):
                 name = target.name
         entry = {"id": uuid.uuid4().hex, "name": clean_name(name), "path": str(target),
-                 "created": now(), "opened": None, "storage": None}
+                 "created": now(), "opened": None, "storage": {"folder_bytes": folder_size(target)}}
         self.state["projects"].append(entry)
         self.save()
         return dict(entry)
@@ -152,5 +152,7 @@ class Workspace:
                 except (OSError, ValueError, AttributeError):
                     item["initialised"] = None
             item["cloud"] = (path / "cloud.json").is_file()
+            # V1 layout: frame objects but no recipe index of the compact Store.
+            item["legacy"] = bool(item["initialised"]) and not (path / "sources.sqlite3").exists()
             output.append(item)
         return output
