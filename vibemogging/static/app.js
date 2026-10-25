@@ -777,6 +777,16 @@ function readRangeInputs() {
   return state.selection;
 }
 
+function formatRangeOnBlur() {
+  const start = parseTime($("rangeStart").value);
+  const end = parseTime($("rangeEnd").value);
+  // Preserve a partially entered range until both fields are valid. Clearing
+  // the first field on blur makes it impossible to enter the second one.
+  if (Number.isFinite(start) && Number.isFinite(end) && end > start && end <= duration() + 1e-6) {
+    renderSelection();
+  }
+}
+
 function onRangeInput() {
   const start = parseTime($("rangeStart").value);
   const end = parseTime($("rangeEnd").value);
@@ -1509,8 +1519,8 @@ $("frameInput").addEventListener("keydown", (event) => {
 
 $("rangeStart").addEventListener("input", onRangeInput);
 $("rangeEnd").addEventListener("input", onRangeInput);
-$("rangeStart").addEventListener("blur", renderSelection);
-$("rangeEnd").addEventListener("blur", renderSelection);
+$("rangeStart").addEventListener("blur", formatRangeOnBlur);
+$("rangeEnd").addEventListener("blur", formatRangeOnBlur);
 $("startFromPlayhead").addEventListener("click", () => {
   const start = snap(frameAt(state.time) / fps());
   const end = state.selection && state.selection.end > start ? state.selection.end : Math.min(duration(), start + 1);
